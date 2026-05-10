@@ -1,0 +1,131 @@
+"""Tests for the topology endpoints under /v1/components.
+
+Skeleton-level — verifies the wire shape and persistence semantics.
+Lifecycle behavior (actual subprocess spawning, status reporting, real
+restart) lands when the supervisor is implemented.
+"""
+
+from __future__ import annotations
+
+from fastapi.testclient import TestClient
+
+
+def _orchestrator_entry() -> dict[str, object]:
+    return {
+        "name": "orchestrator",
+        "kind": "orchestrator",
+        "url": "http://127.0.0.1:8080",
+        "spawn": {"configFile": "/tmp/orch/config.yaml"},
+        "safeMode": False,
+    }
+
+
+def _left_driver_entry() -> dict[str, object]:
+    return {
+        "name": "left",
+        "kind": "hemisphere-driver",
+        "url": "http://127.0.0.1:8081",
+        "spawn": {"configFile": "/tmp/drivers/left/config.yaml"},
+        "safeMode": False,
+    }
+
+
+def test_list_components_starts_empty(client: TestClient) -> None:
+    response = client.get("/v1/components")
+    assert response.status_code == 200
+    assert response.json() == {"components": []}
+
+
+def test_create_then_list_includes_component(client: TestClient) -> None:
+    response = client.post("/v1/components", json=_orchestrator_entry())
+    assert response.status_code == 201
+    body = response.json()
+    assert body["name"] == "orchestrator"
+    # Skeleton always reports `unreachable` until the supervisor is live.
+    assert body["status"] == "unreachable"
+
+    listing = client.get("/v1/components").json()
+    names = [c["name"] for c in listing["components"]]
+    assert names == ["orchestrator"]
+
+
+def test_create_rejects_duplicate_name(client: TestClient) -> None:
+    client.post("/v1/components", json=_orchestrator_entry())
+    response = client.post("/v1/components", json=_orchestrator_entry())
+    assert response.status_code == 409
+
+
+def test_get_component_404_when_missing(client: TestClient) -> None:
+    response = client.get("/v1/components/nonexistent")
+    assert response.status_code == 404
+
+
+def test_patch_component_updates_safe_mode(client: TestClient) -> None:
+    client.post("/v1/components", json=_orchestrator_entry())
+
+    updated = _orchestrator_entry()
+    updated["safeMode"] = True
+    response = client.patch("/v1/components/orchestrator", json=updated)
+    assert response.status_code == 200
+    assert response.json()["safeMode"] is True
+
+
+def test_patch_component_rejects_rename_collision(client: TestClient) -> None:
+    client.post("/v1/components", json=_orchestrator_entry())
+    client.post("/v1/components", json=_left_driver_entry())
+
+    rename_to_existing = _orchestrator_entry()
+    rename_to_existing["name"] = "left"
+    response = client.patch("/v1/components/orchestrator", json=rename_to_existing)
+    assert response.status_code == 409
+
+
+def test_delete_component_removes_it(client: TestClient) -> None:
+    client.post("/v1/components", json=_orchestrator_entry())
+    response = client.delete("/v1/components/orchestrator")
+    assert response.status_code == 204
+
+    listing = client.get("/v1/components").json()
+    assert listing["components"] == []
+
+
+def test_delete_component_404_when_missing(client: TestClient) -> None:
+    response = client.delete("/v1/components/nonexistent")
+    assert response.status_code == 404
+
+
+def test_restart_component_404_when_missing(client: TestClient) -> None:
+    response = client.post("/v1/components/nonexistent/restart")
+    assert response.status_code == 404
+
+
+def test_restart_component_returns_202_skeleton_message(client: TestClient) -> None:
+    client.post("/v1/components", json=_orchestrator_entry())
+    response = client.post("/v1/components/orchestrator/restart")
+    assert response.status_code == 202
+    body = response.json()
+    assert body["scheduled"] is True
+    assert "Skeleton" in body["message"]
+
+
+def test_topology_persists_across_state_reloads(
+    client: TestClient,
+    settings: object,  # imported from conftest fixture
+) -> None:
+    """Adding a component must round-trip through the YAML file so a
+    process restart picks it up. Drives this end-to-end by using a real
+    on-disk path from the fixture."""
+    client.post("/v1/components", json=_orchestrator_entry())
+    listing_before = client.get("/v1/components").json()
+    assert len(listing_before["components"]) == 1
+
+    # Reload state from disk via a fresh app on the same config_file.
+    from fastapi.testclient import TestClient as FreshClient
+
+    from eugene_plexus_watchdog.app import create_app
+
+    fresh_app = create_app(settings=settings)  # type: ignore[arg-type]
+    with FreshClient(fresh_app) as fresh:
+        response = fresh.get("/v1/components")
+        assert response.status_code == 200
+        assert response.json() == listing_before
