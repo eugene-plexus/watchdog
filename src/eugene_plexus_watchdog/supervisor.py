@@ -36,6 +36,7 @@ from urllib.parse import urlparse
 
 import httpx
 
+from . import orphan_kill
 from ._generated.models import ComponentEntry, ComponentKind, ComponentStatus
 
 # How long an exiting child gets to finish flushing before we SIGKILL it
@@ -197,13 +198,22 @@ class SupervisedProcess:
         self._log.info("spawning %s: %s", self.entry.name, " ".join(cmd))
 
         try:
-            self._proc = await asyncio.create_subprocess_exec(*cmd, env=env)
+            self._proc = await asyncio.create_subprocess_exec(
+                *cmd, env=env, **orphan_kill.kwargs_for_platform()
+            )
         except OSError as e:
             self._log.error("failed to spawn %s: %s", self.entry.name, e)
             self.status = ComponentStatus.crashed
             self.last_error = f"spawn failed: {e}"
             self._consecutive_crashes += 1
             return
+
+        # Windows: assign to the watchdog's Job Object so the OS reaps
+        # the child if the watchdog dies hard. POSIX uses preexec_fn
+        # (handled in kwargs above), no post-spawn step needed.
+        win_job = orphan_kill.windows_job()
+        if win_job is not None and self._proc.pid is not None:
+            win_job.assign(self._proc.pid)
 
         self.status = ComponentStatus.safe_mode if self.entry.safeMode else ComponentStatus.starting
         self.last_restart = datetime.now(UTC)
