@@ -1,10 +1,11 @@
 """FastAPI app factory.
 
-Skeleton scope: implements every spec endpoint with a working in-memory
-+ on-disk state, but does NOT yet spawn subprocesses. The supervisor
-loop is the obvious next commit; the wire shape is here so the UI's
-first-run wizard and the ConfigEditor's Components tab can be built
-against this in parallel.
+The supervisor is wired into the lifespan: at startup the watchdog reads
+its topology config and asks the supervisor to spawn every spawned-mode
+child; on shutdown it stops them in turn (SIGTERM with timeout, then
+SIGKILL). The /v1/components routes layer delegates real-time status
+queries to the supervisor so `Component.status` reflects live process
+state instead of the skeleton's hard-coded `unreachable`.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from .routes import config as config_routes
 from .routes import health as health_routes
 from .settings import Settings, load_settings
 from .state import WatchdogState
+from .supervisor import Supervisor
 
 log = logging.getLogger(__name__)
 
@@ -40,7 +42,29 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         state.load()
     app.state.watchdog_state = state
     app.state.safe_mode = settings.safe_mode
-    yield
+
+    # Supervisor injection: tests can pre-populate `app.state.supervisor`
+    # with a stub before the lifespan runs (mirroring the orchestrator's
+    # pattern with hemisphere clients and memory). Production builds the
+    # real one here and tears it down on shutdown.
+    if not hasattr(app.state, "supervisor"):
+        supervisor = Supervisor(log=log)
+        owns_supervisor = True
+    else:
+        supervisor = app.state.supervisor
+        owns_supervisor = False
+    app.state.supervisor = supervisor
+
+    if not settings.safe_mode and owns_supervisor:
+        for entry in state.list_topology_entries():
+            supervisor.add_and_start(entry)
+        await supervisor.start_health_loop(state.list_topology_entries)
+
+    try:
+        yield
+    finally:
+        if owns_supervisor:
+            await supervisor.stop_all()
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:

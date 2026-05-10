@@ -1,10 +1,10 @@
 """Topology endpoints: /v1/components and /v1/components/{name}.
 
-Skeleton implementation — every component reports `unreachable` because
-the supervisor isn't wired yet. Once subprocess management lands the
-status field will reflect actual process state, restart will SIGTERM +
-respawn, and POST will scaffold per-component config files. Wire-shape
-matches the spec so consumers (UI, tests) can be developed against this.
+Combines the declarative topology (from `WatchdogState`) with live state
+from the `Supervisor` (status, pid, lastRestart, lastError) at request
+time. Topology mutations through PATCH/POST/DELETE keep the supervisor
+in sync — adding a component spawns it, removing one stops it,
+updating it triggers a restart so the change takes effect.
 """
 
 from __future__ import annotations
@@ -12,8 +12,9 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException, Request, Response, status
 
 from .._generated.common_models import Problem, RestartResult
-from .._generated.models import Component, ComponentEntry, ComponentList
+from .._generated.models import Component, ComponentEntry, ComponentList, ComponentStatus
 from ..state import WatchdogState
+from ..supervisor import Supervisor
 
 router = APIRouter(tags=["components"])
 
@@ -31,65 +32,111 @@ def _not_found(name: str) -> HTTPException:
     )
 
 
+def _name_conflict(name: str) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail=Problem(
+            type="https://github.com/eugene-plexus/watchdog#component-name-conflict",
+            title="Name already in use",
+            status=409,
+            detail=f"Component {name!r} already exists.",
+            component="watchdog",
+        ).model_dump(exclude_none=True),
+    )
+
+
+def _compose(entry: ComponentEntry, supervisor: Supervisor | None) -> Component:
+    """Combine the declarative entry with whatever live state the
+    Supervisor knows about it. When no Supervisor is wired (some tests),
+    falls back to `unreachable` so the wire shape is still spec-valid."""
+    if supervisor is None:
+        live_status = ComponentStatus.unreachable
+        last_error = None
+        last_restart = None
+        pid = None
+    else:
+        live_status, last_error, last_restart, pid = supervisor.status_for(
+            entry.name, has_spawn=entry.spawn is not None
+        )
+    return Component(
+        name=entry.name,
+        kind=entry.kind,
+        url=entry.url,
+        spawn=entry.spawn,
+        safeMode=entry.safeMode,
+        status=live_status,
+        pid=pid,
+        lastRestart=last_restart,
+        lastError=last_error,
+    )
+
+
+def _supervisor(request: Request) -> Supervisor | None:
+    return getattr(request.app.state, "supervisor", None)
+
+
 @router.get("/v1/components", response_model=ComponentList)
 async def list_components(request: Request) -> ComponentList:
     state: WatchdogState = request.app.state.watchdog_state
-    return ComponentList(components=state.list_components())
+    supervisor = _supervisor(request)
+    return ComponentList(
+        components=[_compose(e, supervisor) for e in state.list_topology_entries()],
+    )
 
 
 @router.post("/v1/components", response_model=Component, status_code=201)
 async def create_component(request: Request, body: ComponentEntry) -> Component:
     state: WatchdogState = request.app.state.watchdog_state
+    supervisor = _supervisor(request)
     try:
-        return state.add_component(body)
+        entry = state.add_topology_entry(body)
     except KeyError as e:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=Problem(
-                type="https://github.com/eugene-plexus/watchdog#component-name-conflict",
-                title="Name already in use",
-                status=409,
-                detail=str(e),
-                component="watchdog",
-            ).model_dump(exclude_none=True),
-        ) from e
+        raise _name_conflict(body.name) from e
+    if supervisor is not None:
+        supervisor.add_and_start(entry)
+    return _compose(entry, supervisor)
 
 
 @router.get("/v1/components/{name}", response_model=Component)
 async def get_component(request: Request, name: str) -> Component:
     state: WatchdogState = request.app.state.watchdog_state
-    found = state.get_component(name)
-    if found is None:
+    entry = state.get_topology_entry(name)
+    if entry is None:
         raise _not_found(name)
-    return found
+    return _compose(entry, _supervisor(request))
 
 
 @router.patch("/v1/components/{name}", response_model=Component)
 async def update_component(request: Request, name: str, body: ComponentEntry) -> Component:
     state: WatchdogState = request.app.state.watchdog_state
+    supervisor = _supervisor(request)
     try:
-        updated = state.update_component(name, body)
+        updated = state.update_topology_entry(name, body)
     except KeyError as e:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=Problem(
-                type="https://github.com/eugene-plexus/watchdog#component-name-conflict",
-                title="Name already in use",
-                status=409,
-                detail=str(e),
-                component="watchdog",
-            ).model_dump(exclude_none=True),
-        ) from e
+        raise _name_conflict(body.name) from e
     if updated is None:
         raise _not_found(name)
-    return updated
+    # Supervised process state is keyed by name, so a rename ends one
+    # supervision and starts another. Updates to a same-name entry just
+    # trigger a restart so the new env vars (port, configFile, safeMode)
+    # take effect.
+    if supervisor is not None:
+        if name != updated.name:
+            await supervisor.remove_and_stop(name)
+            supervisor.add_and_start(updated)
+        else:
+            await supervisor.restart(name)
+    return _compose(updated, supervisor)
 
 
 @router.delete("/v1/components/{name}", status_code=204)
 async def delete_component(request: Request, name: str) -> Response:
     state: WatchdogState = request.app.state.watchdog_state
-    if not state.remove_component(name):
+    supervisor = _supervisor(request)
+    if not state.remove_topology_entry(name):
         raise _not_found(name)
+    if supervisor is not None:
+        await supervisor.remove_and_stop(name)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -99,20 +146,45 @@ async def delete_component(request: Request, name: str) -> Response:
     status_code=202,
 )
 async def restart_component(request: Request, name: str) -> RestartResult:
-    """Skeleton: returns 202 with a stub message. Once the supervisor is
-    wired up this will SIGTERM + respawn the spawned process, or 409 for
-    remote components per the spec."""
     state: WatchdogState = request.app.state.watchdog_state
-    component = state.get_component(name)
-    if component is None:
+    supervisor = _supervisor(request)
+    entry = state.get_topology_entry(name)
+    if entry is None:
         raise _not_found(name)
+    # Remote components have no spawn lifecycle the watchdog can act on.
+    # Per the spec: 409 Conflict.
+    if entry.spawn is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=Problem(
+                type="https://github.com/eugene-plexus/watchdog#cannot-restart-remote",
+                title="Cannot restart remote component",
+                status=409,
+                detail=(
+                    f"Component {name!r} is remote (no spawn block); the "
+                    "watchdog cannot restart what it does not own."
+                ),
+                component="watchdog",
+            ).model_dump(exclude_none=True),
+        )
+    if supervisor is None:
+        # No supervisor wired (some test harnesses). Spec-valid 202 with a
+        # message that makes the situation legible.
+        return RestartResult(
+            scheduled=False,
+            delayMs=0,
+            message="No supervisor is attached to this watchdog instance.",
+        )
+    restarted = await supervisor.restart(name)
+    if not restarted:
+        # Topology entry exists but supervisor doesn't know about it —
+        # transient state during topology edits. Best-effort start.
+        supervisor.add_and_start(entry)
     return RestartResult(
         scheduled=True,
         delayMs=0,
         message=(
-            "Skeleton implementation — supervisor is stubbed. The "
-            "spec-defined restart behavior (SIGTERM the spawned process "
-            "and let the watchdog respawn) lands once subprocess "
-            "management is wired up."
+            f"Sent terminate to {name!r}; the supervisor's restart-on-exit "
+            "loop will respawn it shortly."
         ),
     )

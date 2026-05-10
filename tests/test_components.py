@@ -41,7 +41,8 @@ def test_create_then_list_includes_component(client: TestClient) -> None:
     assert response.status_code == 201
     body = response.json()
     assert body["name"] == "orchestrator"
-    # Skeleton always reports `unreachable` until the supervisor is live.
+    # Stub supervisor reports `unreachable` since it never spawns; real
+    # supervisor would transition through starting -> running.
     assert body["status"] == "unreachable"
 
     listing = client.get("/v1/components").json()
@@ -99,13 +100,29 @@ def test_restart_component_404_when_missing(client: TestClient) -> None:
     assert response.status_code == 404
 
 
-def test_restart_component_returns_202_skeleton_message(client: TestClient) -> None:
+def test_restart_component_returns_202_and_calls_supervisor(
+    client: TestClient, stub_supervisor: object
+) -> None:
     client.post("/v1/components", json=_orchestrator_entry())
     response = client.post("/v1/components/orchestrator/restart")
     assert response.status_code == 202
     body = response.json()
     assert body["scheduled"] is True
-    assert "Skeleton" in body["message"]
+    # The route delegated to the supervisor's restart method.
+    assert ("restart", "orchestrator") in stub_supervisor.calls  # type: ignore[attr-defined]
+
+
+def test_restart_component_409_for_remote(client: TestClient) -> None:
+    """Per the spec: the watchdog cannot restart something it doesn't own."""
+    remote_entry = {
+        "name": "memory",
+        "kind": "memory",
+        "url": "http://memory.lan:8083",
+        # No spawn block => remote.
+    }
+    client.post("/v1/components", json=remote_entry)
+    response = client.post("/v1/components/memory/restart")
+    assert response.status_code == 409
 
 
 def test_topology_persists_across_state_reloads(
@@ -120,11 +137,16 @@ def test_topology_persists_across_state_reloads(
     assert len(listing_before["components"]) == 1
 
     # Reload state from disk via a fresh app on the same config_file.
+    # Inject another stub supervisor so the fresh lifespan doesn't try
+    # to spawn the orchestrator package for real.
     from fastapi.testclient import TestClient as FreshClient
 
     from eugene_plexus_watchdog.app import create_app
 
+    from .conftest import StubSupervisor
+
     fresh_app = create_app(settings=settings)  # type: ignore[arg-type]
+    fresh_app.state.supervisor = StubSupervisor()
     with FreshClient(fresh_app) as fresh:
         response = fresh.get("/v1/components")
         assert response.status_code == 200

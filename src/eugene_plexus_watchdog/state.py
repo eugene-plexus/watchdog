@@ -175,29 +175,28 @@ class WatchdogState:
 
     # ----- topology ---------------------------------------------------
     #
-    # Components are returned with their declarative half populated from
-    # disk and operational half (status, pid, lastRestart, lastError) set
-    # to placeholder values. Once the supervisor is real (post-skeleton),
-    # those will reflect live process state.
+    # `list_topology_entries` returns the declarative half — what the
+    # operator wrote in `watchdog.yaml`. The routes layer combines this
+    # with live state from the Supervisor (status, pid, lastRestart,
+    # lastError) to produce the full `Component` view.
 
-    def list_components(self) -> list[Component]:
+    def list_topology_entries(self) -> list[ComponentEntry]:
         with self._lock:
-            return [self._with_status(entry) for entry in self._components.values()]
+            return list(self._components.values())
 
-    def get_component(self, name: str) -> Component | None:
+    def get_topology_entry(self, name: str) -> ComponentEntry | None:
         with self._lock:
-            entry = self._components.get(name)
-            return self._with_status(entry) if entry is not None else None
+            return self._components.get(name)
 
-    def add_component(self, entry: ComponentEntry) -> Component:
+    def add_topology_entry(self, entry: ComponentEntry) -> ComponentEntry:
         with self._lock:
             if entry.name in self._components:
                 raise KeyError(f"component {entry.name!r} already exists")
             self._components[entry.name] = entry
             self._write_locked()
-            return self._with_status(entry)
+            return entry
 
-    def update_component(self, name: str, entry: ComponentEntry) -> Component | None:
+    def update_topology_entry(self, name: str, entry: ComponentEntry) -> ComponentEntry | None:
         with self._lock:
             if name not in self._components:
                 return None
@@ -208,9 +207,9 @@ class WatchdogState:
                 del self._components[name]
             self._components[entry.name] = entry
             self._write_locked()
-            return self._with_status(entry)
+            return entry
 
-    def remove_component(self, name: str) -> bool:
+    def remove_topology_entry(self, name: str) -> bool:
         with self._lock:
             if name not in self._components:
                 return False
@@ -218,20 +217,31 @@ class WatchdogState:
             self._write_locked()
             return True
 
-    # ----- internals --------------------------------------------------
+    # ----- backwards-compatible Component composition -----------------
+    #
+    # Tests built against the skeleton's `list_components` etc. continue
+    # to work — they just see `unreachable` status when no supervisor is
+    # injected. Production code (routes layer) goes through the
+    # Supervisor for live status.
 
-    @staticmethod
-    def _with_status(entry: ComponentEntry) -> Component:
-        # Skeleton: every component reports `unreachable`. Once the
-        # supervisor is alive this picks up real state.
-        return Component(
-            name=entry.name,
-            kind=ComponentKind(entry.kind.value),
-            url=entry.url,
-            spawn=entry.spawn,
-            safeMode=entry.safeMode,
-            status=ComponentStatus.unreachable,
-        )
+    def list_components(self) -> list[Component]:
+        return [_to_component(e) for e in self.list_topology_entries()]
+
+    def get_component(self, name: str) -> Component | None:
+        entry = self.get_topology_entry(name)
+        return _to_component(entry) if entry is not None else None
+
+    def add_component(self, entry: ComponentEntry) -> Component:
+        return _to_component(self.add_topology_entry(entry))
+
+    def update_component(self, name: str, entry: ComponentEntry) -> Component | None:
+        updated = self.update_topology_entry(name, entry)
+        return _to_component(updated) if updated is not None else None
+
+    def remove_component(self, name: str) -> bool:
+        return self.remove_topology_entry(name)
+
+    # ----- internals --------------------------------------------------
 
     def _write_locked(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -241,6 +251,23 @@ class WatchdogState:
         ]
         with self._path.open("w", encoding="utf-8") as f:
             yaml.safe_dump(out, f, sort_keys=True, default_flow_style=False)
+
+
+def _to_component(entry: ComponentEntry) -> Component:
+    """Compose a Component from a topology entry, with placeholder status.
+
+    Used by the legacy `WatchdogState.list_components` etc. methods —
+    when no Supervisor is available the status is hard-coded to
+    `unreachable`. The routes layer overrides this with live state from
+    the Supervisor when one is wired up."""
+    return Component(
+        name=entry.name,
+        kind=ComponentKind(entry.kind.value),
+        url=entry.url,
+        spawn=entry.spawn,
+        safeMode=entry.safeMode,
+        status=ComponentStatus.unreachable,
+    )
 
 
 def _validate(field: ConfigField, value: Any) -> str | None:
