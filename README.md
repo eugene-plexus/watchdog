@@ -41,10 +41,11 @@ The full contract lives in [`eugene-plexus/specs/openapi/watchdog.yaml`](https:/
 ```bash
 pip install -e ".[dev]"
 python -m eugene_plexus_watchdog
-# default port 8079; override via PATCH /v1/config or the config file
+# default port 8079 (fixed in v0.1 so the UI ships with a known target)
+# state file path: EUGENE_PLEXUS_WATCHDOG_CONFIG_FILE (defaults to ./watchdog.yaml)
 ```
 
-The first run creates a `watchdog.yaml` in the working directory with sensible defaults — `firstRunComplete: false`, an empty topology, and UI prefs. The watchdog then opens a browser at its own address and the UI walks the operator through configuration via the first-run wizard.
+The first run creates a `watchdog.yaml` in the working directory with sensible defaults — `firstRunComplete: false`, an empty topology, and UI prefs. Point a browser at the watchdog's address (default `http://localhost:8079`) and the UI's first-run wizard at `/setup` walks the operator through configuration. Auto-launching the browser at startup is a planned convenience for personal-use installs; v0.1 leaves that to the operator.
 
 ## Why a watchdog at all?
 
