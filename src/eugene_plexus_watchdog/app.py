@@ -9,9 +9,11 @@ state instead of the skeleton's hard-coded `unreachable`.
 
 v0.2 also seeds `app.state.auth_state` with a fresh JWT signing key on
 every startup. The master encryption key starts None and gets populated
-on a successful POST /v1/auth/initialize or /v1/auth/login. OS-keyring
-auto-unlock is on the v0.2 roadmap but not yet wired (operator
-currently must type the passphrase to start a session).
+either by (a) the OS keyring auto-unlock at lifespan startup when
+`securityMode == "os_keyring"`, or (b) on a successful POST
+/v1/auth/initialize or /v1/auth/login. When (a) succeeds, children
+spawned in this same lifespan get MASTER_KEY in their env immediately
+— no Phase-7 restart-on-login churn needed.
 """
 
 from __future__ import annotations
@@ -22,7 +24,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI
 
-from . import __version__, security
+from . import __version__, keyring_store, security
 from .auth_state import AuthState
 from .dependencies import require_operator_session
 from .routes import auth as auth_routes
@@ -58,6 +60,27 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # personal-use installs).
     if not hasattr(app.state, "auth_state"):
         app.state.auth_state = AuthState(signing_key=security.generate_signing_key())
+
+    # OS keyring auto-unlock — only when the operator opted into it
+    # AND a passphrase has been set (so we know which install's key
+    # we're recovering). Safe mode and the no-passphrase first-run
+    # window skip this so a broken keyring backend can't block the
+    # wizard.
+    if (
+        state.has_passphrase()
+        and state.get_config("securityMode") == "os_keyring"
+        and not app.state.auth_state.has_master_key()
+    ):
+        stored = keyring_store.get_master_key()
+        if stored is not None:
+            app.state.auth_state.set_master_key(stored)
+            log.info("master key recovered from OS keyring; children will auto-unlock")
+        else:
+            log.info(
+                "securityMode is os_keyring but no stored key was retrievable; "
+                "operator must log in via POST /v1/auth/login to populate it"
+            )
+
     if state.has_passphrase():
         log.info("watchdog initialized; operator may log in via POST /v1/auth/login")
     else:

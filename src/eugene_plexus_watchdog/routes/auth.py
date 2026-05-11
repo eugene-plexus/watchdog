@@ -28,7 +28,7 @@ from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
-from .. import security
+from .. import keyring_store, security
 from .._generated.common_models import (
     AuthLoginRequest,
     AuthLoginResponse,
@@ -109,6 +109,10 @@ async def initialize(request: Request, body: _InitializeRequest) -> AuthLoginRes
     master_key = security.derive_master_key(body.passphrase, salt)
     auth.set_master_key(master_key)
 
+    # If the operator chose OS-keyring mode, persist the master key
+    # so the next restart auto-unlocks without re-prompting.
+    _persist_master_key_if_keyring_mode(state, master_key)
+
     # If the supervisor was spawned before this initialize call (in
     # production it is — the lifespan builds it during app startup),
     # any children it already launched ran without MASTER_KEY in their
@@ -183,7 +187,15 @@ async def login(request: Request, body: AuthLoginRequest) -> AuthLoginResponse:
         )
     salt = base64.b64decode(salt_b64)
     had_master_key = auth.has_master_key()
-    auth.set_master_key(security.derive_master_key(body.passphrase, salt))
+    derived = security.derive_master_key(body.passphrase, salt)
+    auth.set_master_key(derived)
+
+    # If the operator's chosen mode is OS-keyring, persist the freshly
+    # derived key for next time. Idempotent — same passphrase + salt
+    # produces the same key, so re-saving the same value isn't an
+    # error. Useful when the operator switches `securityMode` from
+    # prompt to keyring without re-initializing.
+    _persist_master_key_if_keyring_mode(state, derived)
 
     # On the FIRST successful login of a process run, children that
     # the supervisor already launched are running without MASTER_KEY in
@@ -202,6 +214,26 @@ async def login(request: Request, body: AuthLoginRequest) -> AuthLoginResponse:
         expiresAt=_dt_from_unix(exp),
         operatorName=None,
     )
+
+
+def _persist_master_key_if_keyring_mode(state: WatchdogState, master_key: bytes) -> None:
+    """Save the master key to the OS keyring when the operator opted in.
+
+    Best-effort: keyring write failures log a warning but don't block
+    the login flow. Worst case: next restart still works, just needs
+    a passphrase prompt. `state.get_config("securityMode")` is the
+    canonical source — the operator may have toggled it after
+    initialize, so we check on every login.
+    """
+    if state.get_config("securityMode") != "os_keyring":
+        return
+    if keyring_store.set_master_key(master_key):
+        log.info("master key persisted to OS keyring for auto-unlock")
+    else:
+        log.warning(
+            "securityMode is os_keyring but keyring write failed; "
+            "auto-unlock will not work on next restart"
+        )
 
 
 async def _restart_supervised_children_if_present(request: Request) -> None:
