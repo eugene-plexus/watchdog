@@ -69,9 +69,11 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Supervisor injection: tests can pre-populate `app.state.supervisor`
     # with a stub before the lifespan runs (mirroring the orchestrator's
     # pattern with hemisphere clients and memory). Production builds the
-    # real one here and tears it down on shutdown.
+    # real one here, sharing the AuthState so each spawn can issue a
+    # service token, forward the signing key, and (if logged in)
+    # forward the master key.
     if not hasattr(app.state, "supervisor"):
-        supervisor = Supervisor(log=log)
+        supervisor = Supervisor(log=log, auth_state=app.state.auth_state)
         owns_supervisor = True
     else:
         supervisor = app.state.supervisor

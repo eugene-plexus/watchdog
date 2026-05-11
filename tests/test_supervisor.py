@@ -14,18 +14,21 @@ anything. Verifies the contract pieces that matter:
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import sys
 from typing import Any
 
 import pytest
 
+from eugene_plexus_watchdog import security
 from eugene_plexus_watchdog._generated.models import (
     ComponentEntry,
     ComponentKind,
     ComponentStatus,
     SpawnConfig,
 )
+from eugene_plexus_watchdog.auth_state import AuthState
 from eugene_plexus_watchdog.supervisor import SupervisedProcess, Supervisor
 
 
@@ -217,3 +220,137 @@ async def test_remote_entry_does_not_spawn(monkeypatch: pytest.MonkeyPatch) -> N
     status, _, _, pid = sup.status_for("memory", has_spawn=False)
     assert status == ComponentStatus.unreachable
     assert pid is None
+
+
+# --------------------------------------------------------------------------- #
+# v0.2 auth env-var threading
+# --------------------------------------------------------------------------- #
+
+
+async def test_auth_state_threads_signing_key_and_service_token(
+    driver_entry: ComponentEntry, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When an AuthState is wired in, every spawned child receives the
+    base64'd JWT signing key plus a freshly-issued service token bound
+    to the component's kind."""
+    captured: dict[str, Any] = {}
+
+    async def fake_create(*_args: Any, **kwargs: Any) -> _FakeProcess:
+        captured["env"] = kwargs.get("env")
+        return _FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+
+    auth = AuthState(signing_key=security.generate_signing_key())
+    sp = SupervisedProcess(driver_entry, logging.getLogger("test"), auth_state=auth)
+    sp.start()
+
+    for _ in range(50):
+        await asyncio.sleep(0.01)
+        if "env" in captured:
+            break
+    await sp.stop()
+
+    env = captured["env"]
+    # Signing key is the shared base64-encoded HMAC key.
+    assert (
+        base64.b64decode(env["EUGENE_PLEXUS_HD_AUTH_SIGNING_KEY"]) == auth.signing_key
+    )
+    # Service token must validate against the same signing key with the
+    # correct service audience.
+    payload = security.decode_token(
+        token=env["EUGENE_PLEXUS_HD_SERVICE_TOKEN"],
+        signing_key=auth.signing_key,
+        expected_audience="service:hemisphere-driver",
+    )
+    assert payload.sub == "hemisphere-driver"
+    # Master key absent because the operator hasn't logged in yet.
+    assert "EUGENE_PLEXUS_HD_MASTER_KEY" not in env
+
+
+async def test_master_key_threaded_after_login(
+    driver_entry: ComponentEntry, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Once `AuthState.master_key` is populated (i.e. operator has
+    logged in), subsequent spawns carry the base64'd master key so
+    children can decrypt at-rest secrets."""
+    captured: dict[str, Any] = {}
+
+    async def fake_create(*_args: Any, **kwargs: Any) -> _FakeProcess:
+        captured["env"] = kwargs.get("env")
+        return _FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+
+    auth = AuthState(signing_key=security.generate_signing_key())
+    auth.set_master_key(b"\x55" * 32)
+
+    sp = SupervisedProcess(driver_entry, logging.getLogger("test"), auth_state=auth)
+    sp.start()
+
+    for _ in range(50):
+        await asyncio.sleep(0.01)
+        if "env" in captured:
+            break
+    await sp.stop()
+
+    env = captured["env"]
+    assert (
+        base64.b64decode(env["EUGENE_PLEXUS_HD_MASTER_KEY"]) == auth.master_key
+    )
+
+
+async def test_orchestrator_and_memory_kinds_get_correct_prefixes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Service-token audience + env-var prefix must follow the kind."""
+    captured: dict[str, dict[str, str]] = {}
+
+    async def fake_create(*_args: Any, **kwargs: Any) -> _FakeProcess:
+        # Tag captures by the kind we expect (read off CONFIG_FILE).
+        env = kwargs.get("env") or {}
+        for kind_prefix in ("ORCH", "HD", "MEM"):
+            if f"EUGENE_PLEXUS_{kind_prefix}_CONFIG_FILE" in env:
+                captured[kind_prefix] = env
+                break
+        return _FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+
+    auth = AuthState(signing_key=security.generate_signing_key())
+    procs: list[SupervisedProcess] = []
+    for kind, prefix, port in [
+        (ComponentKind.orchestrator, "ORCH", 8080),
+        (ComponentKind.memory, "MEM", 8083),
+    ]:
+        entry = ComponentEntry(
+            name=prefix.lower(),
+            kind=kind,
+            url=f"http://127.0.0.1:{port}",  # type: ignore[arg-type]
+            spawn=SpawnConfig(configFile=f"/tmp/{prefix}/config.yaml"),
+            safeMode=False,
+        )
+        sp = SupervisedProcess(entry, logging.getLogger("test"), auth_state=auth)
+        sp.start()
+        procs.append(sp)
+
+    for _ in range(100):
+        await asyncio.sleep(0.01)
+        if {"ORCH", "MEM"}.issubset(captured.keys()):
+            break
+
+    for sp in procs:
+        await sp.stop()
+
+    payload_orch = security.decode_token(
+        token=captured["ORCH"]["EUGENE_PLEXUS_ORCH_SERVICE_TOKEN"],
+        signing_key=auth.signing_key,
+        expected_audience="service:orchestrator",
+    )
+    assert payload_orch.sub == "orchestrator"
+    payload_mem = security.decode_token(
+        token=captured["MEM"]["EUGENE_PLEXUS_MEM_SERVICE_TOKEN"],
+        signing_key=auth.signing_key,
+        expected_audience="service:memory",
+    )
+    assert payload_mem.sub == "memory"

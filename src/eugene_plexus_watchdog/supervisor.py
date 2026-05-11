@@ -25,6 +25,7 @@ dev surface, real installs are Linux/Mac/Docker.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import logging
 import os
@@ -36,8 +37,9 @@ from urllib.parse import urlparse
 
 import httpx
 
-from . import orphan_kill
+from . import orphan_kill, security
 from ._generated.models import ComponentEntry, ComponentKind, ComponentStatus
+from .auth_state import AuthState
 
 # How long an exiting child gets to finish flushing before we SIGKILL it
 # during watchdog shutdown. Long enough for a /v1/admin/restart-style
@@ -86,9 +88,19 @@ class SupervisedProcess:
     until `stop()` is called or the crash threshold trips.
     """
 
-    def __init__(self, entry: ComponentEntry, log: logging.Logger) -> None:
+    def __init__(
+        self,
+        entry: ComponentEntry,
+        log: logging.Logger,
+        auth_state: AuthState | None = None,
+    ) -> None:
         self.entry = entry
         self._log = log
+        # v0.2: auth_state is the source of the per-restart JWT signing
+        # key + (post-login) master key + service token issuance. Optional
+        # for test ergonomics — supervisor tests that don't care about
+        # auth can pass None and get the v0.1 env-var set only.
+        self._auth_state = auth_state
         self._proc: asyncio.subprocess.Process | None = None
         self._task: asyncio.Task[None] | None = None
         self._stop_requested = False
@@ -190,6 +202,33 @@ class SupervisedProcess:
         if port is not None:
             env[f"{prefix}_BIND_PORT"] = str(port)
         env[f"{prefix}_SAFE_MODE"] = "1" if self.entry.safeMode else "0"
+
+        # v0.2 auth env vars. Children that have implemented the v0.2
+        # auth surface (currently watchdog itself; orchestrator/drivers/
+        # memory follow in subsequent commits) read these to (a) validate
+        # inbound bearer tokens against the shared signing key, (b)
+        # present a service token of their own on outbound calls, and
+        # (c) decrypt at-rest secrets like apiKey. Children unaware of
+        # these env vars simply ignore them — fully backward-compatible
+        # rollout.
+        if self._auth_state is not None:
+            kind_value = self.entry.kind.value  # "orchestrator", "hemisphere-driver", "memory"
+            env[f"{prefix}_AUTH_SIGNING_KEY"] = base64.b64encode(
+                self._auth_state.signing_key
+            ).decode("ascii")
+            env[f"{prefix}_SERVICE_TOKEN"] = security.issue_service_token(
+                signing_key=self._auth_state.signing_key,
+                kind=kind_value,
+            )
+            if self._auth_state.master_key is not None:
+                env[f"{prefix}_MASTER_KEY"] = base64.b64encode(
+                    self._auth_state.master_key
+                ).decode("ascii")
+            else:
+                # Be explicit about absence so a child running stale env
+                # from a previous shell can't pick up an unrelated value.
+                env.pop(f"{prefix}_MASTER_KEY", None)
+
         if spawn.env:
             env.update({k: str(v) for k, v in spawn.env.items()})
 
@@ -253,8 +292,17 @@ class Supervisor:
          (a child can be alive but in safe mode, etc.).
     """
 
-    def __init__(self, log: logging.Logger | None = None) -> None:
+    def __init__(
+        self,
+        log: logging.Logger | None = None,
+        auth_state: AuthState | None = None,
+    ) -> None:
         self._log = log or logging.getLogger(__name__)
+        # v0.2: shared with every SupervisedProcess so each spawn can
+        # issue a fresh service token, base64-encode the signing key,
+        # and forward the (possibly-still-None) master key. Optional —
+        # absent for tests that don't care about auth.
+        self._auth_state = auth_state
         self._processes: dict[str, SupervisedProcess] = {}
         self._health_task: asyncio.Task[None] | None = None
         self._health_client: httpx.AsyncClient | None = None
@@ -278,7 +326,7 @@ class Supervisor:
             # reachability, but no SupervisedProcess.
             self._reachable[entry.name] = False
             return
-        sp = SupervisedProcess(entry, self._log)
+        sp = SupervisedProcess(entry, self._log, auth_state=self._auth_state)
         self._processes[entry.name] = sp
         sp.start()
 
