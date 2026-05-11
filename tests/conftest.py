@@ -39,6 +39,7 @@ class StubSupervisor:
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, str]] = []
+        self.restart_all_returns: list[str] = []
 
     def add_and_start(self, entry: ComponentEntry) -> None:
         self.calls.append(("add_and_start", entry.name))
@@ -49,6 +50,13 @@ class StubSupervisor:
     async def restart(self, name: str) -> bool:
         self.calls.append(("restart", name))
         return True
+
+    async def restart_all(self) -> list[str]:
+        """Records the call so the restart-on-login tests can assert
+        the auth route triggered it. Returns an empty list by default
+        — tests that need a non-empty result set `restart_all_returns`."""
+        self.calls.append(("restart_all", ""))
+        return list(self.restart_all_returns)
 
     async def start_health_loop(self, _get_components: Any) -> None:
         self.calls.append(("start_health_loop", ""))

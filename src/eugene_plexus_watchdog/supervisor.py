@@ -344,6 +344,36 @@ class Supervisor:
         await sp.restart()
         return True
 
+    async def restart_all(self) -> list[str]:
+        """SIGTERM every supervised child so their supervision loops
+        respawn them. Used after the operator logs in: children that
+        were already spawned ran with no MASTER_KEY env var (the
+        operator hadn't unlocked yet); the respawn picks up the now-
+        populated key from the shared AuthState.
+
+        Returns the list of component names that were signaled — empty
+        if no children are running yet (e.g. login before topology has
+        anything spawned). Best-effort: per-process restart failures
+        are logged but never raised; the operator's login flow
+        shouldn't error out because one supervised child wedged.
+        """
+        names = list(self._processes.keys())
+        if not names:
+            return []
+        self._log.info(
+            "restart_all: signaling %d supervised process(es) to respawn — "
+            "typically because master key just became available",
+            len(names),
+        )
+        results = await asyncio.gather(
+            *(self._processes[n].restart() for n in names),
+            return_exceptions=True,
+        )
+        for name, result in zip(names, results, strict=False):
+            if isinstance(result, BaseException):
+                self._log.warning("restart_all: %s failed to restart: %s", name, result)
+        return names
+
     async def start_health_loop(self, get_components: Any) -> None:
         """Start the background /healthz polling task. `get_components`
         is a 0-arg callable returning the current ComponentEntry list,

@@ -109,6 +109,14 @@ async def initialize(request: Request, body: _InitializeRequest) -> AuthLoginRes
     master_key = security.derive_master_key(body.passphrase, salt)
     auth.set_master_key(master_key)
 
+    # If the supervisor was spawned before this initialize call (in
+    # production it is — the lifespan builds it during app startup),
+    # any children it already launched ran without MASTER_KEY in their
+    # env. Signal a respawn so they pick it up. No-op when nothing is
+    # running yet (first-run wizard usually completes before topology
+    # is configured), so the operator sees no spurious churn.
+    await _restart_supervised_children_if_present(request)
+
     token, exp = security.issue_operator_token(signing_key=auth.signing_key)
     log.info("first-run passphrase set; operator session issued")
     return AuthLoginResponse(
@@ -174,7 +182,18 @@ async def login(request: Request, body: AuthLoginRequest) -> AuthLoginResponse:
             "watchdog.yaml from a known-good backup or re-initialize.",
         )
     salt = base64.b64decode(salt_b64)
+    had_master_key = auth.has_master_key()
     auth.set_master_key(security.derive_master_key(body.passphrase, salt))
+
+    # On the FIRST successful login of a process run, children that
+    # the supervisor already launched are running without MASTER_KEY in
+    # their env (the lifespan starts them before the operator unlocks).
+    # Signal a respawn so they pick up the now-available key. Skip the
+    # restart on subsequent logins in the same process run — the key
+    # is already threaded to live children, repeated logins would just
+    # churn for no reason.
+    if not had_master_key:
+        await _restart_supervised_children_if_present(request)
 
     token, exp = security.issue_operator_token(signing_key=auth.signing_key)
     log.info("operator login from %s", remote)
@@ -183,6 +202,31 @@ async def login(request: Request, body: AuthLoginRequest) -> AuthLoginResponse:
         expiresAt=_dt_from_unix(exp),
         operatorName=None,
     )
+
+
+async def _restart_supervised_children_if_present(request: Request) -> None:
+    """Ask the supervisor to respawn every child, if one is wired in.
+
+    The supervisor lands on `app.state.supervisor` during the lifespan.
+    Tests that don't exercise supervision skip this step. Production
+    always has it. Catches and logs any errors so the auth route's
+    contract (return a session token on success) isn't broken by a
+    misbehaving child.
+    """
+    supervisor = getattr(request.app.state, "supervisor", None)
+    if supervisor is None:
+        return
+    try:
+        restarted = await supervisor.restart_all()
+        if restarted:
+            log.info(
+                "signaled %d supervised child(ren) to respawn so they pick "
+                "up the now-available MASTER_KEY: %s",
+                len(restarted),
+                ", ".join(restarted),
+            )
+    except Exception as e:
+        log.warning("restart_all failed; children may run without master key: %s", e)
 
 
 @router.delete("/v1/auth/sessions/current", status_code=204)
