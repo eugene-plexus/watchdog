@@ -303,13 +303,18 @@ async def test_master_key_threaded_after_login(
 async def test_orchestrator_and_memory_kinds_get_correct_prefixes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Service-token audience + env-var prefix must follow the kind."""
+    """Service-token audience + env-var prefix must follow the kind.
+
+    Exercises all four spawnable kinds so a future enum addition (e.g.
+    `connector`) is caught by an obvious mismatch in this test rather
+    than by a silent unsupported-kind KeyError at spawn time.
+    """
     captured: dict[str, dict[str, str]] = {}
 
     async def fake_create(*_args: Any, **kwargs: Any) -> _FakeProcess:
         # Tag captures by the kind we expect (read off CONFIG_FILE).
         env = kwargs.get("env") or {}
-        for kind_prefix in ("ORCH", "HD", "MEM"):
+        for kind_prefix in ("ORCH", "HD", "MEM", "IDENTITY"):
             if f"EUGENE_PLEXUS_{kind_prefix}_CONFIG_FILE" in env:
                 captured[kind_prefix] = env
                 break
@@ -322,6 +327,7 @@ async def test_orchestrator_and_memory_kinds_get_correct_prefixes(
     for kind, prefix, port in [
         (ComponentKind.orchestrator, "ORCH", 8080),
         (ComponentKind.memory, "MEM", 8083),
+        (ComponentKind.identity, "IDENTITY", 8084),
     ]:
         entry = ComponentEntry(
             name=prefix.lower(),
@@ -336,7 +342,7 @@ async def test_orchestrator_and_memory_kinds_get_correct_prefixes(
 
     for _ in range(100):
         await asyncio.sleep(0.01)
-        if {"ORCH", "MEM"}.issubset(captured.keys()):
+        if {"ORCH", "MEM", "IDENTITY"}.issubset(captured.keys()):
             break
 
     for sp in procs:
@@ -354,3 +360,9 @@ async def test_orchestrator_and_memory_kinds_get_correct_prefixes(
         expected_audience="service:memory",
     )
     assert payload_mem.sub == "memory"
+    payload_identity = security.decode_token(
+        token=captured["IDENTITY"]["EUGENE_PLEXUS_IDENTITY_SERVICE_TOKEN"],
+        signing_key=auth.signing_key,
+        expected_audience="service:identity",
+    )
+    assert payload_identity.sub == "identity"

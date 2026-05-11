@@ -69,6 +69,7 @@ _KIND_TO_MODULE: dict[ComponentKind, str] = {
     ComponentKind.orchestrator: "eugene_plexus_orchestrator",
     ComponentKind.hemisphere_driver: "eugene_plexus_hemisphere_driver",
     ComponentKind.memory: "eugene_plexus_memory",
+    ComponentKind.identity: "eugene_plexus_identity",
 }
 
 # Env-var prefix per component kind, matching what each component's
@@ -77,6 +78,7 @@ _KIND_TO_ENV_PREFIX: dict[ComponentKind, str] = {
     ComponentKind.orchestrator: "EUGENE_PLEXUS_ORCH",
     ComponentKind.hemisphere_driver: "EUGENE_PLEXUS_HD",
     ComponentKind.memory: "EUGENE_PLEXUS_MEM",
+    ComponentKind.identity: "EUGENE_PLEXUS_IDENTITY",
 }
 
 
