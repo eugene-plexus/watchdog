@@ -6,6 +6,12 @@ child; on shutdown it stops them in turn (SIGTERM with timeout, then
 SIGKILL). The /v1/components routes layer delegates real-time status
 queries to the supervisor so `Component.status` reflects live process
 state instead of the skeleton's hard-coded `unreachable`.
+
+v0.2 also seeds `app.state.auth_state` with a fresh JWT signing key on
+every startup. The master encryption key starts None and gets populated
+on a successful POST /v1/auth/initialize or /v1/auth/login. OS-keyring
+auto-unlock is on the v0.2 roadmap but not yet wired (operator
+currently must type the passphrase to start a session).
 """
 
 from __future__ import annotations
@@ -14,9 +20,12 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 
-from . import __version__
+from . import __version__, security
+from .auth_state import AuthState
+from .dependencies import require_operator_session
+from .routes import auth as auth_routes
 from .routes import components as components_routes
 from .routes import config as config_routes
 from .routes import health as health_routes
@@ -42,6 +51,20 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         state.load()
     app.state.watchdog_state = state
     app.state.safe_mode = settings.safe_mode
+
+    # v0.2 auth state. Tests can pre-populate before the lifespan runs.
+    # Production builds a fresh signing key here; rotating at every
+    # startup is the v0.2 revocation story (good-enough for one-operator
+    # personal-use installs).
+    if not hasattr(app.state, "auth_state"):
+        app.state.auth_state = AuthState(signing_key=security.generate_signing_key())
+    if state.has_passphrase():
+        log.info("watchdog initialized; operator may log in via POST /v1/auth/login")
+    else:
+        log.info(
+            "watchdog has no passphrase set; first-run wizard must call "
+            "POST /v1/auth/initialize before other endpoints become available",
+        )
 
     # Supervisor injection: tests can pre-populate `app.state.supervisor`
     # with a stub before the lifespan runs (mirroring the orchestrator's
@@ -79,8 +102,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.state.settings = settings
 
+    # Public routes (no auth required).
     app.include_router(health_routes.router)
-    app.include_router(config_routes.router)
-    app.include_router(components_routes.router)
+    app.include_router(auth_routes.router)
+
+    # v0.2 protected routes — bearer session token required.
+    protected_dependencies = [Depends(require_operator_session)]
+    app.include_router(config_routes.router, dependencies=protected_dependencies)
+    app.include_router(components_routes.router, dependencies=protected_dependencies)
 
     return app

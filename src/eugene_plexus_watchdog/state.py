@@ -60,6 +60,25 @@ CONFIG_FIELDS: list[ConfigField] = [
         default=False,
     ),
     ConfigField(
+        key="securityMode",
+        label="Security mode",
+        description=(
+            "How the watchdog handles its master encryption key "
+            "between restarts. Set during the wizard, editable later. "
+            "'Prompt on startup' keeps the master key in process "
+            "memory only (passphrase required every restart). "
+            "'OS keyring' stores it in your OS Credential Manager / "
+            "Keychain / Secret Service for auto-unlock; more "
+            "convenient, weaker boundary."
+        ),
+        category="security",
+        valueType=ConfigValueType.enum,
+        default="prompt_on_startup",
+        enumValues=["prompt_on_startup", "os_keyring"],
+        enumLabels=["Prompt on startup", "OS keyring auto-unlock"],
+        requiresRestart=True,
+    ),
+    ConfigField(
         key="uiTheme",
         label="Theme",
         description="Color theme for the Eugene Plexus UI.",
@@ -82,6 +101,7 @@ CONFIG_FIELDS: list[ConfigField] = [
 ]
 CATEGORY_LABELS: dict[str, str] = {
     "setup": "Setup",
+    "security": "Security",
     "ui": "Appearance",
 }
 
@@ -93,13 +113,27 @@ def _config_defaults() -> dict[str, Any]:
 
 
 class WatchdogState:
-    """Threadsafe owner of `watchdog.yaml`. Single lock, single file write."""
+    """Threadsafe owner of `watchdog.yaml`. Single lock, single file write.
+
+    Holds three things:
+      * The flat config dict exposed via `/v1/config` (`firstRunComplete`,
+        `securityMode`, UI prefs).
+      * The component topology under `/v1/components`.
+      * (v0.2) An `auth` block (`passphraseHash`, `masterSalt`) which is
+        persisted but NOT exposed via the config endpoints — it's
+        internal trust-root state read by the login endpoint only.
+    """
 
     def __init__(self, path: Path) -> None:
         self._path = path
         self._lock = threading.Lock()
         self._config: dict[str, Any] = _config_defaults()
         self._components: dict[str, ComponentEntry] = {}
+        # v0.2 auth block. Persisted to disk under `auth:` in watchdog.yaml.
+        # passphraseHash: Argon2id-PHC string (verifiable, not reversible)
+        # masterSalt:     base64-encoded 16-byte salt used to derive the
+        #                 master key from the passphrase via Argon2id raw.
+        self._auth: dict[str, Any] = {}
 
     # ----- lifecycle --------------------------------------------------
 
@@ -119,9 +153,11 @@ class WatchdogState:
                 for entry in comps_raw:
                     parsed = ComponentEntry.model_validate(entry)
                     self._components[parsed.name] = parsed
+                self._auth = dict(raw.get("auth") or {})
             else:
                 self._config = _config_defaults()
                 self._components = {}
+                self._auth = {}
                 self._write_locked()
 
     # ----- config trio ------------------------------------------------
@@ -241,6 +277,45 @@ class WatchdogState:
     def remove_component(self, name: str) -> bool:
         return self.remove_topology_entry(name)
 
+    # ----- auth (v0.2) -----------------------------------------------
+    #
+    # NOT exposed via /v1/config. These are internal trust-root state:
+    # the passphrase hash + master-key salt. Login reads them; the
+    # wizard sets them; nothing else touches them.
+
+    def has_passphrase(self) -> bool:
+        """True once the wizard has set a passphrase."""
+        with self._lock:
+            return bool(self._auth.get("passphraseHash"))
+
+    def get_passphrase_hash(self) -> str | None:
+        with self._lock:
+            value = self._auth.get("passphraseHash")
+            return value if isinstance(value, str) else None
+
+    def get_master_salt_b64(self) -> str | None:
+        with self._lock:
+            value = self._auth.get("masterSalt")
+            return value if isinstance(value, str) else None
+
+    def set_passphrase(self, *, passphrase_hash: str, master_salt_b64: str) -> None:
+        """Persist the wizard's passphrase hash + master-key salt.
+
+        Idempotent — calling again overwrites prior values (used by
+        the "change passphrase" flow in v0.3+; v0.2 only sets at
+        first run).
+        """
+        if not passphrase_hash:
+            raise ValueError("passphraseHash must not be empty")
+        if not master_salt_b64:
+            raise ValueError("masterSalt must not be empty")
+        with self._lock:
+            self._auth = {
+                "passphraseHash": passphrase_hash,
+                "masterSalt": master_salt_b64,
+            }
+            self._write_locked()
+
     # ----- internals --------------------------------------------------
 
     def _write_locked(self) -> None:
@@ -249,6 +324,8 @@ class WatchdogState:
         out["components"] = [
             entry.model_dump(exclude_none=True, mode="json") for entry in self._components.values()
         ]
+        if self._auth:
+            out["auth"] = dict(self._auth)
         with self._path.open("w", encoding="utf-8") as f:
             yaml.safe_dump(out, f, sort_keys=True, default_flow_style=False)
 

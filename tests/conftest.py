@@ -5,6 +5,12 @@ so the routes layer's spawn / restart / stop calls become observable
 no-ops instead of trying to fork real Python processes for the body
 components. End-to-end smoke tests against real children belong in a
 separate harness, not the unit suite.
+
+v0.2 adds auth-protected routes. Tests get an `authed_client` fixture
+that initializes a passphrase, captures the resulting session token,
+and attaches it to every request. Tests that exercise the auth surface
+itself (login flow, rate limiting, token validation) use the bare
+`client` fixture so they control auth themselves.
 """
 
 from __future__ import annotations
@@ -21,6 +27,8 @@ from fastapi.testclient import TestClient
 from eugene_plexus_watchdog._generated.models import ComponentEntry, ComponentStatus
 from eugene_plexus_watchdog.app import create_app
 from eugene_plexus_watchdog.settings import Settings
+
+TEST_PASSPHRASE = "correct horse battery staple"
 
 
 class StubSupervisor:
@@ -75,5 +83,20 @@ def app(settings: Settings, stub_supervisor: StubSupervisor) -> FastAPI:
 
 @pytest.fixture
 def client(app: FastAPI) -> Iterator[TestClient]:
+    """Bare TestClient — no auth headers attached. Use for testing
+    the auth surface itself (login, rate limiting, etc.)."""
     with TestClient(app) as c:
+        yield c
+
+
+@pytest.fixture
+def authed_client(app: FastAPI) -> Iterator[TestClient]:
+    """TestClient with a pre-initialized passphrase and the resulting
+    session token attached as the default Authorization header.
+    Use this for testing any v0.2-protected route."""
+    with TestClient(app) as c:
+        resp = c.post("/v1/auth/initialize", json={"passphrase": TEST_PASSPHRASE})
+        assert resp.status_code == 200, f"initialize failed: {resp.status_code} {resp.text}"
+        token = resp.json()["sessionToken"]
+        c.headers["Authorization"] = f"Bearer {token}"
         yield c
