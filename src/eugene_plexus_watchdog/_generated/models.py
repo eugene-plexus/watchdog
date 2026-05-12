@@ -13,9 +13,9 @@ class ComponentKind(StrEnum):
     Which Eugene Plexus component class this entry represents. The
     watchdog's spawn registry maps each kind to a launch command.
     v0.1 covered three body parts (orchestrator, hemisphere-driver,
-    memory); v0.2 adds `identity` (the Default Mode Network — see
-    `openapi/identity.yaml`). The `connector` kind lands later in
-    v0.2 once the connector repo exists.
+    memory). v0.2 adds `identity` (the Default Mode Network — see
+    `openapi/identity.yaml`) and `connector` (external sense
+    organs — see `openapi/connector.yaml`).
 
     """
 
@@ -23,6 +23,7 @@ class ComponentKind(StrEnum):
     hemisphere_driver = 'hemisphere-driver'
     memory = 'memory'
     identity = 'identity'
+    connector = 'connector'
 
 
 class SpawnConfig(BaseModel):
