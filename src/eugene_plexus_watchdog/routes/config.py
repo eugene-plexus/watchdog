@@ -8,6 +8,7 @@ the install. See `state.py` for the rationale.
 from __future__ import annotations
 
 import logging
+import time
 
 from fastapi import APIRouter, Request
 
@@ -15,6 +16,8 @@ from .. import keyring_store
 from .._generated.common_models import (
     ConfigDocument,
     ConfigSchema,
+    ConfigTestRequest,
+    ConfigTestResult,
     ConfigUpdateRequest,
     ConfigUpdateResult,
 )
@@ -35,6 +38,83 @@ async def get_config(request: Request) -> ConfigDocument:
 async def get_config_schema(request: Request) -> ConfigSchema:
     state: WatchdogState = request.app.state.watchdog_state
     return state.as_config_schema()
+
+
+@router.post("/v1/config/test", response_model=ConfigTestResult)
+async def test_config(
+    request: Request,
+    body: ConfigTestRequest | None = None,
+) -> ConfigTestResult:
+    """Probe the watchdog's effective config without committing.
+
+    Most config fields here (UI prefs, firstRunComplete) have no
+    external dependency to verify, so they always succeed. The
+    interesting case is `securityMode=os_keyring` — the OS keyring
+    backend varies by platform and can fail silently (Linux without
+    a running secret service, Windows without Credential Manager,
+    etc.). We probe a round-trip read here so the operator finds
+    out at config-time rather than at the next-boot auto-unlock
+    attempt.
+
+    Body's `overrides` are honored so the operator can test a
+    pending switch BEFORE saving it. v0.2 only consumes the
+    `securityMode` override; other fields are no-ops.
+    """
+    start = time.perf_counter()
+    state: WatchdogState = request.app.state.watchdog_state
+    overrides = (body.overrides or {}) if body is not None else {}
+    effective_mode = (
+        overrides.get("securityMode")
+        if "securityMode" in overrides
+        else state.get_config("securityMode")
+    )
+
+    if effective_mode == "os_keyring":
+        # Read whatever's there. Returning None is fine — it means
+        # the operator hasn't logged in yet, so nothing's stored.
+        # A KeyringError raised internally would log + return None
+        # too. Either result tells us the backend is functional.
+        try:
+            keyring_store.get_master_key()
+        except Exception as e:  # noqa: BLE001 — defensive
+            elapsed_ms = int((time.perf_counter() - start) * 1000)
+            return ConfigTestResult(
+                ok=False,
+                component="watchdog",
+                latencyMs=elapsed_ms,
+                error=(
+                    f"OS keyring probe raised {type(e).__name__}: {e}. "
+                    f"securityMode=os_keyring will fail to auto-unlock on "
+                    f"next boot. Switch to prompt_on_startup, or install / "
+                    f"start the platform's keyring backend (Credential "
+                    f"Manager on Windows, Secret Service on Linux, "
+                    f"Keychain on macOS)."
+                ),
+            )
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        return ConfigTestResult(
+            ok=True,
+            component="watchdog",
+            latencyMs=elapsed_ms,
+            summary=(
+                "OS keyring backend is reachable. Auto-unlock will work "
+                "on next boot once the operator has logged in (the "
+                "master key is persisted on login or on securityMode "
+                "transition to os_keyring)."
+            ),
+        )
+
+    elapsed_ms = int((time.perf_counter() - start) * 1000)
+    return ConfigTestResult(
+        ok=True,
+        component="watchdog",
+        latencyMs=elapsed_ms,
+        summary=(
+            f"securityMode={effective_mode}; no external dependency to "
+            f"verify. (Switch to os_keyring to probe the OS secret "
+            f"store round-trip.)"
+        ),
+    )
 
 
 @router.patch("/v1/config", response_model=ConfigUpdateResult)
