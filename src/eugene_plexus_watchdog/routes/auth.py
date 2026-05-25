@@ -65,6 +65,19 @@ def _problem(status_code: int, title: str, detail: str) -> HTTPException:
     )
 
 
+@router.get("/v1/auth/status")
+async def auth_status(request: Request) -> dict[str, bool]:
+    """Public probe — has a passphrase been set on this install?
+
+    The UI uses this to disambiguate "fresh install, route to /setup"
+    from "logged-out, route to /login" without consuming a rate-limited
+    login attempt. Returns one boolean only; no secrets, no per-IP
+    behavior, no rate limit — safe to call on every page load.
+    """
+    state: WatchdogState = request.app.state.watchdog_state
+    return {"initialized": state.has_passphrase()}
+
+
 class _InitializeRequest(BaseModel):
     """The wizard's payload for first-run passphrase setup."""
 

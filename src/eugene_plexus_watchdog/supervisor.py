@@ -172,6 +172,40 @@ class SupervisedProcess:
 
     # --- internals ---------------------------------------------------------
 
+    async def _pipe_child_output(self, stream: asyncio.StreamReader | None) -> None:
+        """Drain a child's stdout/stderr pipe and re-emit each line with
+        the component name prefix. Runs as a background task per spawn;
+        exits when the pipe closes (child terminated) or it's cancelled.
+
+        Bytes are decoded with `errors="replace"` so a child that writes
+        non-UTF-8 to stdout (rare but possible — a Windows native CRT
+        diagnostic, say) doesn't kill the reader and leave the watchdog
+        deaf to subsequent output.
+        """
+        if stream is None:
+            return
+        prefix = f"[{self.entry.name}] "
+        try:
+            while True:
+                line = await stream.readline()
+                if not line:
+                    return
+                text = line.decode("utf-8", errors="replace")
+                # Lines from `readline()` include the trailing newline;
+                # use `end=""` so we don't double it. flush=True keeps
+                # output snappy even when watchdog stdout is itself a pipe
+                # (e.g. running under a VS Code task with output capture).
+                print(prefix + text, end="", flush=True)
+        except asyncio.CancelledError:
+            return
+        except Exception as e:  # noqa: BLE001 — last-ditch isolation
+            # Never let a reader crash bring down the supervision loop;
+            # the worst-case fallback is "we lose log prefixing for this
+            # child", which is strictly better than the watchdog dying.
+            self._log.warning(
+                "output-pipe reader for %s crashed: %s", self.entry.name, e
+            )
+
     async def _run(self) -> None:
         """Spawn-watch-respawn loop. Exits cleanly on stop or after the
         crash threshold trips."""
@@ -236,13 +270,29 @@ class SupervisedProcess:
         if spawn.env:
             env.update({k: str(v) for k, v in spawn.env.items()})
 
+        # Force unbuffered Python output. Without this, redirecting the
+        # child's stdout to a pipe (below) makes Python switch to block-
+        # buffered mode, so child log lines arrive in 4KB chunks instead
+        # of immediately — exactly when you want the opposite (debugging
+        # a hang where ANY line emitted before the stall is the clue).
+        env["PYTHONUNBUFFERED"] = "1"
+
         module = _KIND_TO_MODULE[self.entry.kind]
         cmd = [sys.executable, "-m", module]
         self._log.info("spawning %s: %s", self.entry.name, " ".join(cmd))
 
         try:
+            # Pipe stdout + stderr through us so we can prefix every line
+            # with `[<name>]`. Without this the watchdog inherits the
+            # parent terminal and child output interleaves with no source
+            # identification — making "Waiting for application startup"
+            # ambiguous when several children are booting concurrently.
             self._proc = await asyncio.create_subprocess_exec(
-                *cmd, env=env, **orphan_kill.kwargs_for_platform()
+                *cmd,
+                env=env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                **orphan_kill.kwargs_for_platform(),
             )
         except OSError as e:
             self._log.error("failed to spawn %s: %s", self.entry.name, e)
@@ -262,7 +312,26 @@ class SupervisedProcess:
         self.last_restart = datetime.now(UTC)
         self.last_error = None
 
-        return_code = await self._proc.wait()
+        # Background reader: drains the child's stdout pipe and re-emits
+        # each line with a `[<name>]` prefix on the watchdog's own stdout.
+        # MUST be running before we await proc.wait() or the child can
+        # block writing into a full pipe buffer and never exit.
+        reader_task = asyncio.create_task(
+            self._pipe_child_output(self._proc.stdout),
+            name=f"output-pipe:{self.entry.name}",
+        )
+
+        try:
+            return_code = await self._proc.wait()
+        finally:
+            # Give the reader a moment to drain any final lines the child
+            # wrote on its way out, then cancel if it's still hung.
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(reader_task, timeout=1.0)
+            if not reader_task.done():
+                reader_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, BaseException):
+                    await reader_task
         self._proc = None
 
         if self._stop_requested:
