@@ -41,3 +41,8 @@ config.yaml
 # src/eugene_plexus_hemisphere_driver/_generated/, but the
 # scratch directory the codegen script downloads into is local-only.
 .codegen-cache/
+
+# --- Runtime artifacts ---
+# Console-capture log files live next to watchdog.yaml by default
+# (see console_logging.py). Operator-local, not source.
+logs/

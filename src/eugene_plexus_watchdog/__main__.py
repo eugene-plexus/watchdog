@@ -5,12 +5,23 @@ from __future__ import annotations
 import uvicorn
 
 from .app import create_app
+from .console_logging import install_console_capture
 from .settings import load_settings
 from .state import WatchdogState
 
 
 def main() -> None:
     settings = load_settings()
+
+    # Mirror stdout/stderr to a rotating log file FIRST — before anything
+    # else writes a line. Captures the watchdog's own uvicorn output,
+    # every supervised child line (which we re-emit through `print()`),
+    # and any library-level log calls. The file lives next to
+    # watchdog.yaml so it's discoverable for bug reports without the
+    # operator having to fish through env vars or task command flags.
+    log_dir = settings.config_file.resolve().parent / "logs"
+    log_path = install_console_capture(log_dir=log_dir)
+    print(f"watchdog: console output is mirrored to {log_path}", flush=True)
 
     bootstrap_state = WatchdogState(settings.config_file)
     if not settings.safe_mode:
