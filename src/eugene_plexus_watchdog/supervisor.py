@@ -120,6 +120,32 @@ _KIND_TO_ENV_PREFIX: dict[ComponentKind, str] = {
     ComponentKind.connector: "EUGENE_PLEXUS_CONNECTOR",
 }
 
+# Short, log-friendly label per component kind. Used by the output reader
+# to disambiguate user-chosen names: drivers are named "left"/"right" by
+# convention but operators can rename them to anything (including
+# "memory" or "connector"), so a bare `[left]` prefix is ambiguous about
+# the kind. When `name != short_label`, the prefix becomes
+# `[<short_label>: <name>]` (e.g. `[driver: left]`); when they match
+# (the default for orchestrator/memory/identity/connector), we keep the
+# shorter `[<name>]` form to avoid `[memory: memory]`-style redundancy.
+_KIND_SHORT_LABEL: dict[ComponentKind, str] = {
+    ComponentKind.orchestrator: "orchestrator",
+    ComponentKind.hemisphere_driver: "driver",
+    ComponentKind.memory: "memory",
+    ComponentKind.identity: "identity",
+    ComponentKind.connector: "connector",
+}
+
+
+def _format_log_prefix(kind: ComponentKind, name: str) -> str:
+    """Build the `[<...>] ` prefix the supervisor stamps on each child
+    line. `[<name>]` when the name matches the kind's short label,
+    `[<kind>: <name>]` otherwise — see `_KIND_SHORT_LABEL`."""
+    short = _KIND_SHORT_LABEL.get(kind, kind.value)
+    if name == short:
+        return f"[{name}] "
+    return f"[{short}: {name}] "
+
 
 class SupervisedProcess:
     """One supervised child: its declared topology entry plus live state.
@@ -221,7 +247,7 @@ class SupervisedProcess:
         """
         if stream is None:
             return
-        prefix = f"[{self.entry.name}] "
+        prefix = _format_log_prefix(self.entry.kind, self.entry.name)
         try:
             while True:
                 line = await stream.readline()

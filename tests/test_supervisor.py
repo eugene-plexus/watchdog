@@ -33,6 +33,7 @@ from eugene_plexus_watchdog.supervisor import (
     SupervisedProcess,
     Supervisor,
     _colorize_alerts,
+    _format_log_prefix,
     _HEALTHZ_2XX_LINE,
 )
 
@@ -436,3 +437,25 @@ def test_colorize_alerts_respects_no_color(monkeypatch: pytest.MonkeyPatch) -> N
     the helper returns the original text unchanged."""
     monkeypatch.setattr("eugene_plexus_watchdog.supervisor._USE_COLOR", False)
     assert _colorize_alerts("ERROR boom\n") == "ERROR boom\n"
+
+
+def test_log_prefix_disambiguates_renamed_components() -> None:
+    """User-chosen component names can collide with kind names ("left"
+    is conventional for a driver but nothing stops an operator naming a
+    driver "memory"). When name == the kind's short label, the prefix
+    stays `[name]`; otherwise it expands to `[short_label: name]`."""
+    # Default-name cases: short and clean.
+    assert _format_log_prefix(ComponentKind.orchestrator, "orchestrator") == "[orchestrator] "
+    assert _format_log_prefix(ComponentKind.memory, "memory") == "[memory] "
+    assert _format_log_prefix(ComponentKind.identity, "identity") == "[identity] "
+    assert _format_log_prefix(ComponentKind.connector, "connector") == "[connector] "
+
+    # Driver-with-conventional-name: disambiguation prefix kicks in,
+    # since the kind's short label ("driver") differs from the name.
+    assert _format_log_prefix(ComponentKind.hemisphere_driver, "left") == "[driver: left] "
+    assert _format_log_prefix(ComponentKind.hemisphere_driver, "right") == "[driver: right] "
+
+    # User-renamed components that collide with another kind's label
+    # still get disambiguated by their actual kind.
+    assert _format_log_prefix(ComponentKind.connector, "discord") == "[connector: discord] "
+    assert _format_log_prefix(ComponentKind.memory, "vault") == "[memory: vault] "
