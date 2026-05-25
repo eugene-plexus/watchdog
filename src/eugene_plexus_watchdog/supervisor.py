@@ -172,6 +172,13 @@ class SupervisedProcess:
         self._task: asyncio.Task[None] | None = None
         self._stop_requested = False
         self._consecutive_crashes = 0
+        # Set to True when the supervisor decides to fall back to safe
+        # mode after the crash threshold trips — see `_run`. Subsequent
+        # spawns force-set SAFE_MODE=1 in env regardless of the
+        # topology's `safeMode` flag, so /v1/config stays reachable for
+        # operator repair. Cleared on manual restart() (operator wants
+        # to try normal mode again after fixing the underlying issue).
+        self._auto_safe_mode_engaged = False
 
         self.status: ComponentStatus = ComponentStatus.starting
         self.last_error: str | None = None
@@ -188,9 +195,13 @@ class SupervisedProcess:
 
     async def restart(self) -> None:
         """SIGTERM the child; the supervision loop respawns it. Clears
-        the crash counter so a manual restart can recover from the
-        backoff state."""
+        the crash counter AND the auto-safe-mode flag so a manual
+        restart returns the component to normal-mode operation —
+        operator's intent on hitting Restart is "try again with the
+        config I just fixed", not "stay in safe mode forever."
+        """
         self._consecutive_crashes = 0
+        self._auto_safe_mode_engaged = False
         proc = self._proc
         if proc is not None and proc.returncode is None:
             self._log.info(
@@ -280,22 +291,56 @@ class SupervisedProcess:
             )
 
     async def _run(self) -> None:
-        """Spawn-watch-respawn loop. Exits cleanly on stop or after the
-        crash threshold trips."""
+        """Spawn-watch-respawn loop.
+
+        Two-stage backoff: the FIRST time the crash threshold trips
+        (component bad-config or similar), we automatically fall back
+        to SAFE MODE so the operator can repair via /v1/config without
+        having to know about env vars or YAML edits. The second time
+        the threshold trips (safe mode itself is crashing — config
+        endpoint is unreachable; this should be rare and indicates a
+        real bug rather than bad operator config), we give up for real.
+        Exits cleanly on `stop_requested`.
+        """
         while not self._stop_requested:
             await self._spawn_once()
             if self._stop_requested:
                 return
             if self._consecutive_crashes >= _CRASH_BACKOFF_THRESHOLD:
-                self._log.error(
-                    "%s crashed %d times in a row; giving up. POST "
-                    "/v1/components/%s/restart to reset.",
-                    self.entry.name,
-                    self._consecutive_crashes,
-                    self.entry.name,
-                )
-                self.status = ComponentStatus.crashed
-                return
+                if not self._auto_safe_mode_engaged:
+                    # First trip: engage auto-safe-mode, reset the
+                    # counter, continue. Next spawn forces SAFE_MODE=1
+                    # regardless of topology so /v1/config is reachable.
+                    self._log.error(
+                        "%s crashed %d times in a row; falling back to "
+                        "SAFE MODE so /v1/config stays reachable for "
+                        "repair (last error: %s). The component will "
+                        "respawn with SAFE_MODE=1 — UI Components tab "
+                        "will show the safe_mode badge; fix config "
+                        "there and Restart to return to normal mode.",
+                        self.entry.name,
+                        self._consecutive_crashes,
+                        self.last_error,
+                    )
+                    self._auto_safe_mode_engaged = True
+                    self._consecutive_crashes = 0
+                else:
+                    # Second trip: safe mode itself can't boot. This is
+                    # a real bug (or fundamentally broken environment) —
+                    # the operator can't recover via the UI because
+                    # the config endpoint isn't up. Give up for real.
+                    self._log.error(
+                        "%s crashed %d times in a row even in SAFE MODE "
+                        "(last error: %s); giving up. POST /v1/components"
+                        "/%s/restart to reset after fixing whatever is "
+                        "preventing safe-mode startup.",
+                        self.entry.name,
+                        self._consecutive_crashes,
+                        self.last_error,
+                        self.entry.name,
+                    )
+                    self.status = ComponentStatus.crashed
+                    return
             await asyncio.sleep(min(2.0 * self._consecutive_crashes, 10.0))
 
     async def _spawn_once(self) -> None:
@@ -312,7 +357,12 @@ class SupervisedProcess:
         port = urlparse(str(self.entry.url)).port
         if port is not None:
             env[f"{prefix}_BIND_PORT"] = str(port)
-        env[f"{prefix}_SAFE_MODE"] = "1" if self.entry.safeMode else "0"
+        # Two sources of "boot in safe mode": the operator's explicit
+        # topology toggle (`ComponentEntry.safeMode`) AND the
+        # supervisor's auto-fallback after the crash threshold (see
+        # `_run`). Either one forces SAFE_MODE=1 in env.
+        safe_mode_effective = self.entry.safeMode or self._auto_safe_mode_engaged
+        env[f"{prefix}_SAFE_MODE"] = "1" if safe_mode_effective else "0"
 
         # v0.2 auth env vars. Children that have implemented the v0.2
         # auth surface (currently watchdog itself; orchestrator/drivers/
@@ -381,7 +431,9 @@ class SupervisedProcess:
         if win_job is not None and self._proc.pid is not None:
             win_job.assign(self._proc.pid)
 
-        self.status = ComponentStatus.safe_mode if self.entry.safeMode else ComponentStatus.starting
+        self.status = (
+            ComponentStatus.safe_mode if safe_mode_effective else ComponentStatus.starting
+        )
         self.last_restart = datetime.now(UTC)
         self.last_error = None
 

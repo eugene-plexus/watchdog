@@ -439,6 +439,117 @@ def test_colorize_alerts_respects_no_color(monkeypatch: pytest.MonkeyPatch) -> N
     assert _colorize_alerts("ERROR boom\n") == "ERROR boom\n"
 
 
+async def test_auto_safe_mode_after_crash_threshold(
+    driver_entry: ComponentEntry, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After N consecutive crashes the supervisor falls back to SAFE
+    MODE on the next spawn — closes the 'doesn't soft-brick' loop so
+    /v1/config stays reachable for repair without operator env-var or
+    YAML knowledge."""
+    captured_envs: list[dict[str, str]] = []
+    processes: list[_FakeProcess] = []
+
+    async def fake_create(*_args: Any, **kwargs: Any) -> _FakeProcess:
+        captured_envs.append(kwargs.get("env") or {})
+        proc = _FakeProcess()
+        processes.append(proc)
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+
+    # Cap every asyncio.sleep at 10ms so the supervisor's between-crash
+    # backoff (up to 10s) doesn't slow this test by a wall-clock minute.
+    original_sleep = asyncio.sleep
+
+    async def _fast_sleep(seconds: float) -> None:
+        await original_sleep(min(seconds, 0.01))
+
+    monkeypatch.setattr(asyncio, "sleep", _fast_sleep)
+
+    sp = SupervisedProcess(driver_entry, logging.getLogger("test"))
+    sp.start()
+
+    # Drive 5 consecutive crashes (matches _CRASH_BACKOFF_THRESHOLD).
+    for crash_n in range(5):
+        for _ in range(200):
+            await asyncio.sleep(0.01)
+            if len(processes) >= crash_n + 1:
+                break
+        else:
+            pytest.fail(f"spawn {crash_n + 1} never happened")
+        processes[crash_n]._finish(1)  # non-zero = crash
+
+    # The 6th spawn should be the auto-safe-mode one.
+    for _ in range(200):
+        await asyncio.sleep(0.01)
+        if len(captured_envs) >= 6:
+            break
+
+    await sp.stop()
+
+    assert len(captured_envs) >= 6, (
+        f"expected >= 6 spawns after 5 crashes; got {len(captured_envs)}"
+    )
+    # First 5 spawns: normal mode (topology safeMode=False).
+    for i in range(5):
+        assert captured_envs[i]["EUGENE_PLEXUS_HD_SAFE_MODE"] == "0", (
+            f"spawn {i} should have been normal mode, "
+            f"got SAFE_MODE={captured_envs[i]['EUGENE_PLEXUS_HD_SAFE_MODE']}"
+        )
+    # Spawn 6 onward: auto-engaged safe mode.
+    assert captured_envs[5]["EUGENE_PLEXUS_HD_SAFE_MODE"] == "1", (
+        "spawn after threshold should be SAFE_MODE=1"
+    )
+    # Status reflects the fall-back, not `crashed`.
+    assert sp.status == ComponentStatus.safe_mode
+
+
+async def test_manual_restart_clears_auto_safe_mode(
+    driver_entry: ComponentEntry, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Operator's `restart()` returns the component to normal-mode
+    operation — clears the auto-fallback flag so the next spawn
+    follows the topology's safeMode value, not the latched fallback."""
+    captured_envs: list[dict[str, str]] = []
+    processes: list[_FakeProcess] = []
+
+    async def fake_create(*_args: Any, **kwargs: Any) -> _FakeProcess:
+        captured_envs.append(kwargs.get("env") or {})
+        proc = _FakeProcess()
+        processes.append(proc)
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+
+    sp = SupervisedProcess(driver_entry, logging.getLogger("test"))
+    # Skip the crash dance — pre-engage the flag and confirm the next
+    # spawn is safe mode, then restart and confirm it's back to normal.
+    sp._auto_safe_mode_engaged = True
+    sp.start()
+
+    for _ in range(100):
+        await asyncio.sleep(0.01)
+        if captured_envs:
+            break
+    assert captured_envs[0]["EUGENE_PLEXUS_HD_SAFE_MODE"] == "1"
+
+    # Manual restart: clears the flag, terminates the proc, supervisor
+    # respawns. _FakeProcess.terminate() calls _finish(0) (clean exit),
+    # so the supervisor loop resets the crash counter and respawns.
+    await sp.restart()
+    for _ in range(200):
+        await asyncio.sleep(0.01)
+        if len(captured_envs) >= 2:
+            break
+
+    await sp.stop()
+
+    assert len(captured_envs) >= 2
+    assert captured_envs[1]["EUGENE_PLEXUS_HD_SAFE_MODE"] == "0", (
+        "post-restart spawn should be back to normal mode"
+    )
+
+
 def test_log_prefix_disambiguates_renamed_components() -> None:
     """User-chosen component names can collide with kind names ("left"
     is conventional for a driver but nothing stops an operator naming a
