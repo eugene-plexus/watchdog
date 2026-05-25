@@ -29,7 +29,12 @@ from eugene_plexus_watchdog._generated.models import (
     SpawnConfig,
 )
 from eugene_plexus_watchdog.auth_state import AuthState
-from eugene_plexus_watchdog.supervisor import SupervisedProcess, Supervisor
+from eugene_plexus_watchdog.supervisor import (
+    SupervisedProcess,
+    Supervisor,
+    _colorize_alerts,
+    _HEALTHZ_2XX_LINE,
+)
 
 
 class _FakeProcess:
@@ -378,3 +383,56 @@ async def test_orchestrator_and_memory_kinds_get_correct_prefixes(
         expected_audience="service:connector",
     )
     assert payload_connector.sub == "connector"
+
+
+# --------------------------------------------------------------------------- #
+# Child-output filtering / coloring (signal-noise reduction)
+# --------------------------------------------------------------------------- #
+
+
+def test_healthz_filter_matches_2xx_only() -> None:
+    """Successful /healthz access logs are the dominant noise source —
+    we suppress them. Non-2xx must pass through so a newly-unhealthy
+    component is still visible."""
+    ok = 'INFO:     127.0.0.1:59471 - "GET /healthz HTTP/1.1" 200 OK\n'
+    accepted = 'INFO:     127.0.0.1:59471 - "GET /healthz HTTP/1.1" 202 Accepted\n'
+    sad_503 = 'INFO:     127.0.0.1:59471 - "GET /healthz HTTP/1.1" 503 Service Unavailable\n'
+    sad_404 = 'INFO:     127.0.0.1:59471 - "GET /healthz HTTP/1.1" 404 Not Found\n'
+    unrelated = 'INFO:     127.0.0.1:59471 - "POST /v1/chat HTTP/1.1" 200 OK\n'
+
+    assert _HEALTHZ_2XX_LINE.search(ok)
+    assert _HEALTHZ_2XX_LINE.search(accepted)
+    assert not _HEALTHZ_2XX_LINE.search(sad_503)
+    assert not _HEALTHZ_2XX_LINE.search(sad_404)
+    assert not _HEALTHZ_2XX_LINE.search(unrelated)
+
+
+def test_colorize_alerts_wraps_just_the_word(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only the alert WORD gets wrapped — coloring the whole line makes
+    red-on-dark unreadable. Case must be preserved."""
+    # Force-enable color regardless of NO_COLOR in the test env.
+    monkeypatch.setattr("eugene_plexus_watchdog.supervisor._USE_COLOR", True)
+
+    err = _colorize_alerts("ERROR: something broke\n")
+    assert err.startswith("\x1b[31mERROR\x1b[0m: something broke")
+
+    warn = _colorize_alerts("Warning: dropping cache\n")
+    assert warn.startswith("\x1b[33mWarning\x1b[0m: dropping cache")
+
+    # Mid-line, mixed case, both severities in one line.
+    multi = _colorize_alerts("warn x; ERROR y\n")
+    assert "\x1b[33mwarn\x1b[0m" in multi
+    assert "\x1b[31mERROR\x1b[0m" in multi
+
+    # Substring matches don't fire (no \berror\b inside "errored-out").
+    no_match = _colorize_alerts("The action errored-out cleanly\n")
+    assert "\x1b[" not in no_match
+
+
+def test_colorize_alerts_respects_no_color(monkeypatch: pytest.MonkeyPatch) -> None:
+    """NO_COLOR is a documented opt-out (https://no-color.org). When set,
+    the helper returns the original text unchanged."""
+    monkeypatch.setattr("eugene_plexus_watchdog.supervisor._USE_COLOR", False)
+    assert _colorize_alerts("ERROR boom\n") == "ERROR boom\n"

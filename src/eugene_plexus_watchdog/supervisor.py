@@ -29,6 +29,7 @@ import base64
 import contextlib
 import logging
 import os
+import re
 import sys
 import time
 from datetime import UTC, datetime
@@ -58,6 +59,42 @@ _HEALTH_POLL_SECONDS = 1.5
 # exits immediately would respawn-storm forever. Operator must POST to
 # /v1/components/<name>/restart to clear the crashed state.
 _CRASH_BACKOFF_THRESHOLD = 5
+
+# Successful /healthz probes fire every 1.5s per component and contribute
+# nothing to debugging — they push real signal out of the scrollback. We
+# suppress 2xx healthz lines at the supervisor's output reader (one place,
+# applies to every component) while letting 4xx/5xx fall through so a
+# component that starts failing its own health checks still shows up.
+_HEALTHZ_2XX_LINE = re.compile(r'"GET /healthz HTTP/[^"]+" 2\d\d')
+
+# Color the alert WORDS (not the whole line — red on dark backgrounds is
+# unreadable) so a quick scroll-by spots errors and warnings instantly.
+# ANSI SGR codes work in every modern terminal: VS Code's integrated
+# terminal/output pane, Windows Terminal, modern cmd.exe with VTP. Older
+# environments may render the raw escape sequences — set NO_COLOR=1 in
+# the env to disable (https://no-color.org/).
+_ALERT_WORD_RE = re.compile(r"\b(error|warning|warn)\b", re.IGNORECASE)
+_ANSI_RESET = "\x1b[0m"
+_ANSI_BY_WORD = {
+    "error": "\x1b[31m",    # red
+    "warning": "\x1b[33m",  # yellow
+    "warn": "\x1b[33m",
+}
+_USE_COLOR = "NO_COLOR" not in os.environ
+
+
+def _colorize_alerts(text: str) -> str:
+    """Wrap any error/warning word in the matching ANSI color code,
+    preserving the original case. No-op when NO_COLOR is set."""
+    if not _USE_COLOR:
+        return text
+
+    def _wrap(match: re.Match[str]) -> str:
+        word = match.group(0)
+        return f"{_ANSI_BY_WORD[word.lower()]}{word}{_ANSI_RESET}"
+
+    return _ALERT_WORD_RE.sub(_wrap, text)
+
 
 # Module name to spawn for each body-component kind. The watchdog uses
 # `sys.executable -m <module>` so it spawns whichever Python interpreter
@@ -191,6 +228,16 @@ class SupervisedProcess:
                 if not line:
                     return
                 text = line.decode("utf-8", errors="replace")
+                # Suppress successful /healthz access logs — every spawned
+                # component answers a probe every ~1.5s, dwarfing the rest
+                # of the log. Non-2xx healthz still passes through so a
+                # newly-unhealthy component is visible.
+                if _HEALTHZ_2XX_LINE.search(text):
+                    continue
+                # Colorize "error" / "warning" / "warn" inline so the
+                # important lines pop on a fast scroll. Word-level only —
+                # full-line color is unreadable on dark terminals.
+                text = _colorize_alerts(text)
                 # Lines from `readline()` include the trailing newline;
                 # use `end=""` so we don't double it. flush=True keeps
                 # output snappy even when watchdog stdout is itself a pipe
