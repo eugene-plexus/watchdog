@@ -116,7 +116,7 @@ class WindowsJobObject:
         kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
         handle = kernel32.CreateJobObjectW(None, None)
         if not handle:
-            raise OSError(ctypes.get_last_error(), "CreateJobObjectW failed")
+            raise OSError(ctypes.get_last_error(), "CreateJobObjectW failed")  # type: ignore[attr-defined,unused-ignore]
 
         # Build JOBOBJECT_EXTENDED_LIMIT_INFORMATION with the kill-on-close flag.
         class _IoCounters(ctypes.Structure):
@@ -169,7 +169,7 @@ class WindowsJobObject:
             ctypes.sizeof(info),
         )
         if not ok:
-            raise OSError(ctypes.get_last_error(), "SetInformationJobObject failed")
+            raise OSError(ctypes.get_last_error(), "SetInformationJobObject failed")  # type: ignore[attr-defined,unused-ignore]
 
         return int(handle)
 
@@ -184,14 +184,14 @@ class WindowsJobObject:
         kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
         proc_handle = kernel32.OpenProcess(process_access, False, pid)
         if not proc_handle:
-            raise OSError(ctypes.get_last_error(), f"OpenProcess({pid}) failed")
+            raise OSError(ctypes.get_last_error(), f"OpenProcess({pid}) failed")  # type: ignore[attr-defined,unused-ignore]
         try:
             kernel32.AssignProcessToJobObject.restype = ctypes.c_int
             kernel32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
             ok = kernel32.AssignProcessToJobObject(job_handle, proc_handle)
             if not ok:
                 raise OSError(
-                    ctypes.get_last_error(),
+                    ctypes.get_last_error(),  # type: ignore[attr-defined,unused-ignore]
                     f"AssignProcessToJobObject(pid={pid}) failed",
                 )
         finally:
