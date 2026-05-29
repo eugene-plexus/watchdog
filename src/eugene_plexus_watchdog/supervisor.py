@@ -76,7 +76,7 @@ _HEALTHZ_2XX_LINE = re.compile(r'"GET /healthz HTTP/[^"]+" 2\d\d')
 _ALERT_WORD_RE = re.compile(r"\b(error|warning|warn)\b", re.IGNORECASE)
 _ANSI_RESET = "\x1b[0m"
 _ANSI_BY_WORD = {
-    "error": "\x1b[31m",    # red
+    "error": "\x1b[31m",  # red
     "warning": "\x1b[33m",  # yellow
     "warn": "\x1b[33m",
 }
@@ -282,13 +282,11 @@ class SupervisedProcess:
                 print(prefix + text, end="", flush=True)
         except asyncio.CancelledError:
             return
-        except Exception as e:  # noqa: BLE001 — last-ditch isolation
+        except Exception as e:
             # Never let a reader crash bring down the supervision loop;
             # the worst-case fallback is "we lose log prefixing for this
             # child", which is strictly better than the watchdog dying.
-            self._log.warning(
-                "output-pipe reader for %s crashed: %s", self.entry.name, e
-            )
+            self._log.warning("output-pipe reader for %s crashed: %s", self.entry.name, e)
 
     async def _run(self) -> None:
         """Spawn-watch-respawn loop.
@@ -382,9 +380,9 @@ class SupervisedProcess:
                 kind=kind_value,
             )
             if self._auth_state.master_key is not None:
-                env[f"{prefix}_MASTER_KEY"] = base64.b64encode(
-                    self._auth_state.master_key
-                ).decode("ascii")
+                env[f"{prefix}_MASTER_KEY"] = base64.b64encode(self._auth_state.master_key).decode(
+                    "ascii"
+                )
             else:
                 # Be explicit about absence so a child running stale env
                 # from a previous shell can't pick up an unrelated value.
@@ -431,9 +429,7 @@ class SupervisedProcess:
         if win_job is not None and self._proc.pid is not None:
             win_job.assign(self._proc.pid)
 
-        self.status = (
-            ComponentStatus.safe_mode if safe_mode_effective else ComponentStatus.starting
-        )
+        self.status = ComponentStatus.safe_mode if safe_mode_effective else ComponentStatus.starting
         self.last_restart = datetime.now(UTC)
         self.last_error = None
 

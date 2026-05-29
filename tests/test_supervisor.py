@@ -30,11 +30,11 @@ from eugene_plexus_watchdog._generated.models import (
 )
 from eugene_plexus_watchdog.auth_state import AuthState
 from eugene_plexus_watchdog.supervisor import (
+    _HEALTHZ_2XX_LINE,
     SupervisedProcess,
     Supervisor,
     _colorize_alerts,
     _format_log_prefix,
-    _HEALTHZ_2XX_LINE,
 )
 
 
@@ -264,9 +264,7 @@ async def test_auth_state_threads_signing_key_and_service_token(
 
     env = captured["env"]
     # Signing key is the shared base64-encoded HMAC key.
-    assert (
-        base64.b64decode(env["EUGENE_PLEXUS_HD_AUTH_SIGNING_KEY"]) == auth.signing_key
-    )
+    assert base64.b64decode(env["EUGENE_PLEXUS_HD_AUTH_SIGNING_KEY"]) == auth.signing_key
     # Service token must validate against the same signing key with the
     # correct service audience.
     payload = security.decode_token(
@@ -306,9 +304,7 @@ async def test_master_key_threaded_after_login(
     await sp.stop()
 
     env = captured["env"]
-    assert (
-        base64.b64decode(env["EUGENE_PLEXUS_HD_MASTER_KEY"]) == auth.master_key
-    )
+    assert base64.b64decode(env["EUGENE_PLEXUS_HD_MASTER_KEY"]) == auth.master_key
 
 
 async def test_orchestrator_and_memory_kinds_get_correct_prefixes(

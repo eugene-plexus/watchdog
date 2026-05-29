@@ -59,7 +59,9 @@ def test_initialize_sets_passphrase_and_returns_session_token(client: TestClient
 
 
 def test_initialize_refuses_when_already_initialized(client: TestClient) -> None:
-    assert client.post("/v1/auth/initialize", json={"passphrase": TEST_PASSPHRASE}).status_code == 200
+    assert (
+        client.post("/v1/auth/initialize", json={"passphrase": TEST_PASSPHRASE}).status_code == 200
+    )
     second = client.post("/v1/auth/initialize", json={"passphrase": "another-passphrase"})
     assert second.status_code == 409
     assert "Already initialized" in second.json()["detail"]["title"]

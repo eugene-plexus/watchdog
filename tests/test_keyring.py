@@ -69,9 +69,7 @@ class _FakeKeyring:
         try:
             del self.store[(service, username)]
         except KeyError as e:
-            raise keyring.errors.PasswordDeleteError(
-                f"no value at {service!r}:{username!r}"
-            ) from e
+            raise keyring.errors.PasswordDeleteError(f"no value at {service!r}:{username!r}") from e
 
 
 @pytest.fixture
@@ -140,9 +138,9 @@ def test_keyring_store_get_handles_garbage_b64(fake_keyring: _FakeKeyring) -> No
 
 def test_keyring_store_get_handles_wrong_length(fake_keyring: _FakeKeyring) -> None:
     """An entry that base64-decodes but isn't 32 bytes — discard."""
-    fake_keyring.store[(keyring_store.SERVICE, keyring_store.USERNAME)] = (
-        base64.b64encode(b"\x00" * 16).decode("ascii")
-    )
+    fake_keyring.store[(keyring_store.SERVICE, keyring_store.USERNAME)] = base64.b64encode(
+        b"\x00" * 16
+    ).decode("ascii")
     assert keyring_store.get_master_key() is None
 
 
@@ -151,9 +149,7 @@ def test_keyring_store_get_handles_wrong_length(fake_keyring: _FakeKeyring) -> N
 # --------------------------------------------------------------------------- #
 
 
-def _seed_install(
-    tmp_path: Path, *, security_mode: str
-) -> tuple[Settings, bytes]:
+def _seed_install(tmp_path: Path, *, security_mode: str) -> tuple[Settings, bytes]:
     """Build a watchdog.yaml with a passphrase set + the operator's
     chosen securityMode. Returns (settings, derived_master_key)."""
     settings = Settings(config_file=tmp_path / "watchdog.yaml")
@@ -166,9 +162,7 @@ def _seed_install(
         if security_mode != "prompt_on_startup":
             patch = c.patch("/v1/config", json={"securityMode": security_mode})
             assert patch.status_code == 200
-    salt_b64 = yaml.safe_load((tmp_path / "watchdog.yaml").read_text())["auth"][
-        "masterSalt"
-    ]
+    salt_b64 = yaml.safe_load((tmp_path / "watchdog.yaml").read_text())["auth"]["masterSalt"]
     salt = base64.b64decode(salt_b64)
     return settings, security.derive_master_key(TEST_PASSPHRASE, salt)
 
@@ -217,9 +211,9 @@ def test_lifespan_does_not_auto_unlock_when_mode_is_prompt(
     OS store before the operator finishes the wizard."""
     settings, _ = _seed_install(tmp_path, security_mode="prompt_on_startup")
     # Plant a key in the keyring as if it had been left over.
-    isolated_keyring.store[(keyring_store.SERVICE, keyring_store.USERNAME)] = (
-        base64.b64encode(b"\x77" * 32).decode("ascii")
-    )
+    isolated_keyring.store[(keyring_store.SERVICE, keyring_store.USERNAME)] = base64.b64encode(
+        b"\x77" * 32
+    ).decode("ascii")
 
     fresh_app = create_app(settings=settings)
     fresh_app.state.supervisor = StubSupervisor()
@@ -237,9 +231,9 @@ def test_lifespan_no_auto_unlock_when_no_passphrase_set(
     settings = Settings(config_file=tmp_path / "watchdog.yaml")
     # Pre-seed a key as if from an earlier install (operator wiped
     # watchdog.yaml but forgot to clear the keyring).
-    isolated_keyring.store[(keyring_store.SERVICE, keyring_store.USERNAME)] = (
-        base64.b64encode(b"\x33" * 32).decode("ascii")
-    )
+    isolated_keyring.store[(keyring_store.SERVICE, keyring_store.USERNAME)] = base64.b64encode(
+        b"\x33" * 32
+    ).decode("ascii")
 
     fresh_app = create_app(settings=settings)
     fresh_app.state.supervisor = StubSupervisor()
@@ -269,9 +263,7 @@ def test_initialize_persists_master_key_when_in_keyring_mode(
     # the wizard's actual order is set-mode-then-initialize in some
     # designs and initialize-then-set-mode in others.
     config_path = tmp_path / "watchdog.yaml"
-    config_path.write_text(
-        yaml.safe_dump({"securityMode": "os_keyring"}), encoding="utf-8"
-    )
+    config_path.write_text(yaml.safe_dump({"securityMode": "os_keyring"}), encoding="utf-8")
 
     with TestClient(app) as c:
         resp = c.post("/v1/auth/initialize", json={"passphrase": TEST_PASSPHRASE})
@@ -386,9 +378,7 @@ def test_login_succeeds_even_when_keyring_write_fails(
 # --------------------------------------------------------------------------- #
 
 
-def _login_via_loopback(
-    tmp_path: Path, *, security_mode: str
-) -> tuple[Any, TestClient, bytes]:
+def _login_via_loopback(tmp_path: Path, *, security_mode: str) -> tuple[Any, TestClient, bytes]:
     """Spin up an app + TestClient already authed under the given
     security mode. Returns (app, client, master_key)."""
     settings, expected = _seed_install(tmp_path, security_mode=security_mode)

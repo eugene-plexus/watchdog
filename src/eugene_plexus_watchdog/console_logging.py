@@ -27,6 +27,7 @@ Tuning these would mean adding fields to the config_store + UI controls
 
 from __future__ import annotations
 
+import contextlib
 import io
 import logging
 import re
@@ -58,12 +59,10 @@ class _TeeStream(io.TextIOBase):
         self._buf = ""
         self._lock = threading.Lock()
 
-    def write(self, data: str) -> int:  # type: ignore[override]
+    def write(self, data: str) -> int:
         # Console: forward immediately, untouched (preserves ANSI color).
-        try:
+        with contextlib.suppress(Exception):
             self._console.write(data)
-        except Exception:
-            pass
         # File: split on newlines, emit one record per complete line.
         # Partial trailing text stays in `_buf` until the next newline.
         with self._lock:
@@ -73,30 +72,28 @@ class _TeeStream(io.TextIOBase):
                 if nl < 0:
                     break
                 line = self._buf[:nl]
-                self._buf = self._buf[nl + 1:]
+                self._buf = self._buf[nl + 1 :]
                 self._capture.info(_ANSI_SGR_RE.sub("", line))
         return len(data)
 
     def flush(self) -> None:
-        try:
+        with contextlib.suppress(Exception):
             self._console.flush()
-        except Exception:
-            pass
         # File handlers flush per-emit; nothing else to do here. We
         # deliberately do NOT flush partial buffered text — a half-line
         # at exit time is rare and the next write would emit it anyway.
 
-    def isatty(self) -> bool:  # type: ignore[override]
+    def isatty(self) -> bool:
         # Tee'd output is not a TTY. Callers using `isatty()` to detect
         # color support get False; the supervisor's own color decision
         # uses NO_COLOR env-var instead and runs before we install
         # the tee, so live-terminal colors are unaffected.
         return False
 
-    def fileno(self) -> int:  # type: ignore[override]
+    def fileno(self) -> int:
         return self._console.fileno()
 
-    def writable(self) -> bool:  # type: ignore[override]
+    def writable(self) -> bool:
         return True
 
 
@@ -139,6 +136,10 @@ def install_console_capture(
 
     # Use the unwrapped __stdout__ / __stderr__ as the console side, so
     # repeated calls don't recursively wrap a previous tee on stdout.
-    sys.stdout = _TeeStream(sys.__stdout__, capture)  # type: ignore[assignment]
-    sys.stderr = _TeeStream(sys.__stderr__, capture)  # type: ignore[assignment]
+    # __stdout__/__stderr__ can be None (e.g. a no-console pythonw host);
+    # fall back to the current streams so the tee still installs.
+    console_out: TextIO = sys.__stdout__ or sys.stdout
+    console_err: TextIO = sys.__stderr__ or sys.stderr
+    sys.stdout = _TeeStream(console_out, capture)
+    sys.stderr = _TeeStream(console_err, capture)
     return log_path

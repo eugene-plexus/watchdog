@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import time
+from typing import Any
 
 from fastapi import APIRouter, Request
 
@@ -62,7 +63,9 @@ async def test_config(
     """
     start = time.perf_counter()
     state: WatchdogState = request.app.state.watchdog_state
-    overrides = (body.overrides or {}) if body is not None else {}
+    overrides: dict[str, Any] = (
+        body.overrides.model_dump() if body is not None and body.overrides is not None else {}
+    )
     effective_mode = (
         overrides.get("securityMode")
         if "securityMode" in overrides
@@ -76,7 +79,7 @@ async def test_config(
         # too. Either result tells us the backend is functional.
         try:
             keyring_store.get_master_key()
-        except Exception as e:  # noqa: BLE001 — defensive
+        except Exception as e:
             elapsed_ms = int((time.perf_counter() - start) * 1000)
             return ConfigTestResult(
                 ok=False,
@@ -147,9 +150,6 @@ async def patch_config(request: Request, body: ConfigUpdateRequest) -> ConfigUpd
         # both paths converge to "next restart works".
         auth = request.app.state.auth_state
         if auth.has_master_key() and keyring_store.set_master_key(auth.master_key):
-            log.info(
-                "securityMode changed to os_keyring; persisted master key "
-                "for auto-unlock"
-            )
+            log.info("securityMode changed to os_keyring; persisted master key for auto-unlock")
 
     return result

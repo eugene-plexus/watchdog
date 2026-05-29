@@ -44,9 +44,7 @@ class AuthState:
     # Per-source-IP sliding-window log of failed login attempts. Kept
     # in AuthState (rather than module-global) so tests get a clean
     # rate-limit state with each fresh app fixture.
-    login_failures: dict[str, deque[float]] = field(
-        default_factory=lambda: defaultdict(deque)
-    )
+    login_failures: dict[str, deque[float]] = field(default_factory=lambda: defaultdict(deque))
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def has_master_key(self) -> bool:
@@ -66,9 +64,7 @@ class AuthState:
         with self._lock:
             return token in self.revoked_tokens
 
-    def record_login_failure(
-        self, source: str, *, window_seconds: int, max_in_window: int
-    ) -> bool:
+    def record_login_failure(self, source: str, *, window_seconds: int, max_in_window: int) -> bool:
         """Append a failure for this source; return True iff the source
         is now at or above the rate limit."""
         now = time.time()

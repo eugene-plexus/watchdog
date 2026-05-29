@@ -46,3 +46,15 @@ config.yaml
 # Console-capture log files live next to watchdog.yaml by default
 # (see console_logging.py). Operator-local, not source.
 logs/
+
+# Wizard/first-run generated topology + per-component configs and the
+# component databases. All operator-local install state — a fresh clone
+# regenerates them. Never source, and may hold secrets (API keys).
+watchdog.yaml
+adapters.yaml
+constitution.yaml
+component-configs/
+*.db
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal

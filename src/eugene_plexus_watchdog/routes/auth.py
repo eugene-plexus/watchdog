@@ -181,8 +181,7 @@ async def login(request: Request, body: AuthLoginRequest) -> AuthLoginResponse:
         raise _problem(
             status.HTTP_401_UNAUTHORIZED,
             "Wrong passphrase",
-            "Passphrase did not match. Repeated failures from one source "
-            "are rate-limited.",
+            "Passphrase did not match. Repeated failures from one source are rate-limited.",
         )
 
     auth.clear_login_failures(remote)

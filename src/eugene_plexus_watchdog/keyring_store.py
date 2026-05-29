@@ -65,14 +65,10 @@ def get_master_key() -> bytes | None:
     try:
         raw = base64.b64decode(encoded, validate=True)
     except Exception as e:
-        log.warning(
-            "stored keyring value is not valid base64 (%s); ignoring", e
-        )
+        log.warning("stored keyring value is not valid base64 (%s); ignoring", e)
         return None
     if len(raw) != 32:
-        log.warning(
-            "stored keyring value is %d bytes, expected 32; ignoring", len(raw)
-        )
+        log.warning("stored keyring value is %d bytes, expected 32; ignoring", len(raw))
         return None
     return raw
 

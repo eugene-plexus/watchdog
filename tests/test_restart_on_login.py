@@ -131,6 +131,9 @@ class _FakeProcess:
         self.terminated = False
         self.killed = False
         self._exit_event = asyncio.Event()
+        # Supervisor pipes the child's stdout and spawns a reader task;
+        # None makes the reader a no-op (see test_supervisor.py's fake).
+        self.stdout: asyncio.StreamReader | None = None
 
     async def wait(self) -> int:
         await self._exit_event.wait()
