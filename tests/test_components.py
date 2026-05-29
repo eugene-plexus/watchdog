@@ -9,6 +9,20 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
+from eugene_plexus_watchdog import security
+
+
+def _service_token(client: TestClient) -> str:
+    """Mint a validly-signed service-audience token for the running app.
+
+    Peers (orchestrator, identity, connector) call /v1/components with a
+    token like this to auto-resolve topology. Signed with the app's live
+    signing key so signature verification passes; only the audience marks
+    it as a service rather than operator token.
+    """
+    signing_key = client.app.state.auth_state.signing_key  # type: ignore[attr-defined]
+    return security.issue_service_token(signing_key=signing_key, kind="orchestrator")
+
 
 def _orchestrator_entry() -> dict[str, object]:
     return {
@@ -161,3 +175,63 @@ def test_topology_persists_across_state_reloads(
         response = fresh.get("/v1/components")
         assert response.status_code == 200
         assert response.json() == listing_before
+
+
+# --------------------------------------------------------------------------- #
+# v0.2.1: service tokens may READ topology but never mutate it.
+# Fixes the auth mismatch where peer auto-resolve silently no-op'd because
+# the whole router was operator-only. (project_watchdog_components_auth_mismatch)
+# --------------------------------------------------------------------------- #
+
+
+def test_service_token_can_read_components_list(authed_client: TestClient) -> None:
+    authed_client.post("/v1/components", json=_orchestrator_entry())
+    # Swap the operator session for a peer's service token.
+    authed_client.headers["Authorization"] = f"Bearer {_service_token(authed_client)}"
+    response = authed_client.get("/v1/components")
+    assert response.status_code == 200
+    assert [c["name"] for c in response.json()["components"]] == ["orchestrator"]
+
+
+def test_service_token_can_read_single_component(authed_client: TestClient) -> None:
+    authed_client.post("/v1/components", json=_orchestrator_entry())
+    authed_client.headers["Authorization"] = f"Bearer {_service_token(authed_client)}"
+    response = authed_client.get("/v1/components/orchestrator")
+    assert response.status_code == 200
+    assert response.json()["name"] == "orchestrator"
+
+
+def test_service_token_cannot_create_component(authed_client: TestClient) -> None:
+    authed_client.headers["Authorization"] = f"Bearer {_service_token(authed_client)}"
+    response = authed_client.post("/v1/components", json=_orchestrator_entry())
+    assert response.status_code == 401
+
+
+def test_service_token_cannot_patch_component(authed_client: TestClient) -> None:
+    authed_client.post("/v1/components", json=_orchestrator_entry())
+    authed_client.headers["Authorization"] = f"Bearer {_service_token(authed_client)}"
+    updated = _orchestrator_entry()
+    updated["safeMode"] = True
+    response = authed_client.patch("/v1/components/orchestrator", json=updated)
+    assert response.status_code == 401
+
+
+def test_service_token_cannot_delete_component(authed_client: TestClient) -> None:
+    authed_client.post("/v1/components", json=_orchestrator_entry())
+    authed_client.headers["Authorization"] = f"Bearer {_service_token(authed_client)}"
+    response = authed_client.delete("/v1/components/orchestrator")
+    assert response.status_code == 401
+
+
+def test_service_token_cannot_restart_component(authed_client: TestClient) -> None:
+    authed_client.post("/v1/components", json=_orchestrator_entry())
+    authed_client.headers["Authorization"] = f"Bearer {_service_token(authed_client)}"
+    response = authed_client.post("/v1/components/orchestrator/restart")
+    assert response.status_code == 401
+
+
+def test_unauthenticated_read_still_rejected(authed_client: TestClient) -> None:
+    """Loosening to operator-OR-service is not the same as public —
+    a request with no token at all is still 401 on the read endpoints."""
+    authed_client.headers.pop("Authorization", None)
+    assert authed_client.get("/v1/components").status_code == 401

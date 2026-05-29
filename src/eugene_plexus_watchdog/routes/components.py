@@ -9,14 +9,22 @@ updating it triggers a restart so the change takes effect.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 
 from .._generated.common_models import Problem, RestartResult
 from .._generated.models import Component, ComponentEntry, ComponentList, ComponentStatus
+from ..dependencies import require_operator_or_service, require_operator_session
 from ..state import WatchdogState
 from ..supervisor import Supervisor
 
 router = APIRouter(tags=["components"])
+
+# Reads accept operator OR service tokens so peer components can
+# auto-resolve topology with their service token; mutations stay
+# operator-only (a leaked service token must not be able to re-spawn or
+# delete components). See dependencies.require_operator_or_service.
+_read_auth = [Depends(require_operator_or_service)]
+_write_auth = [Depends(require_operator_session)]
 
 
 def _not_found(name: str) -> HTTPException:
@@ -75,7 +83,7 @@ def _supervisor(request: Request) -> Supervisor | None:
     return getattr(request.app.state, "supervisor", None)
 
 
-@router.get("/v1/components", response_model=ComponentList)
+@router.get("/v1/components", response_model=ComponentList, dependencies=_read_auth)
 async def list_components(request: Request) -> ComponentList:
     state: WatchdogState = request.app.state.watchdog_state
     supervisor = _supervisor(request)
@@ -84,7 +92,7 @@ async def list_components(request: Request) -> ComponentList:
     )
 
 
-@router.post("/v1/components", response_model=Component, status_code=201)
+@router.post("/v1/components", response_model=Component, status_code=201, dependencies=_write_auth)
 async def create_component(request: Request, body: ComponentEntry) -> Component:
     state: WatchdogState = request.app.state.watchdog_state
     supervisor = _supervisor(request)
@@ -97,7 +105,7 @@ async def create_component(request: Request, body: ComponentEntry) -> Component:
     return _compose(entry, supervisor)
 
 
-@router.get("/v1/components/{name}", response_model=Component)
+@router.get("/v1/components/{name}", response_model=Component, dependencies=_read_auth)
 async def get_component(request: Request, name: str) -> Component:
     state: WatchdogState = request.app.state.watchdog_state
     entry = state.get_topology_entry(name)
@@ -106,7 +114,7 @@ async def get_component(request: Request, name: str) -> Component:
     return _compose(entry, _supervisor(request))
 
 
-@router.patch("/v1/components/{name}", response_model=Component)
+@router.patch("/v1/components/{name}", response_model=Component, dependencies=_write_auth)
 async def update_component(request: Request, name: str, body: ComponentEntry) -> Component:
     state: WatchdogState = request.app.state.watchdog_state
     supervisor = _supervisor(request)
@@ -129,7 +137,7 @@ async def update_component(request: Request, name: str, body: ComponentEntry) ->
     return _compose(updated, supervisor)
 
 
-@router.delete("/v1/components/{name}", status_code=204)
+@router.delete("/v1/components/{name}", status_code=204, dependencies=_write_auth)
 async def delete_component(request: Request, name: str) -> Response:
     state: WatchdogState = request.app.state.watchdog_state
     supervisor = _supervisor(request)
@@ -144,6 +152,7 @@ async def delete_component(request: Request, name: str) -> Response:
     "/v1/components/{name}/restart",
     response_model=RestartResult,
     status_code=202,
+    dependencies=_write_auth,
 )
 async def restart_component(request: Request, name: str) -> RestartResult:
     state: WatchdogState = request.app.state.watchdog_state

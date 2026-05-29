@@ -134,6 +134,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # v0.2 protected routes — bearer session token required.
     protected_dependencies = [Depends(require_operator_session)]
     app.include_router(config_routes.router, dependencies=protected_dependencies)
-    app.include_router(components_routes.router, dependencies=protected_dependencies)
+    # The components router declares auth per-route, NOT at the router
+    # level: the read endpoints accept operator OR service tokens (so
+    # peers can auto-resolve topology), while mutations stay operator-
+    # only. A blanket router dependency would force operator-only on the
+    # GETs too, which is the v0.2.1 bug we're fixing.
+    app.include_router(components_routes.router)
 
     return app

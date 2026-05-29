@@ -326,6 +326,13 @@ def decode_token(
     }
     if expected_audience is not None:
         decode_kwargs["audience"] = expected_audience
+    else:
+        # No expected audience to match against — the caller validates the
+        # `aud` claim itself (e.g. "operator OR any service:*"). PyJWT would
+        # otherwise raise InvalidAudienceError for a token that carries an
+        # `aud` claim when no `audience` is supplied, so disable its check.
+        # `aud` is still required-present via the `require` list above.
+        options["verify_aud"] = False
     if now is not None:
         # leeway is in seconds; we pass `now` via `leeway` is awkward —
         # PyJWT validates against time.time() internally. Tests using

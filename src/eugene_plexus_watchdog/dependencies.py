@@ -14,9 +14,16 @@ Two main dependencies:
 Service-token verification is a separate dependency
 (`require_service_token`) so endpoints can scope themselves correctly
 (e.g. POST /v1/identity/links/pending is service-only; PATCH
-/v1/identity/constitution is operator-only). v0.2 watchdog only has
-operator endpoints, so the service dep is defined here for symmetry
-but isn't applied to any watchdog routes yet.
+/v1/identity/constitution is operator-only).
+
+  * `require_operator_or_service` — accepts an operator session token
+    OR *any* `service:*`-audience token. Used by the read-only topology
+    endpoints (`GET /v1/components`, `GET /v1/components/{name}`) so peer
+    components can auto-resolve each other's URLs with their service
+    token. Mutating topology routes stay operator-only. (v0.2.1: before
+    this, the whole `/v1/components` router was operator-only, so every
+    peer auto-resolve silently fell back to localhost defaults —
+    project_watchdog_components_auth_mismatch.)
 """
 
 from __future__ import annotations
@@ -97,6 +104,56 @@ def require_operator_session(
             "Invalid token",
             f"Session token rejected: {e}",
         ) from e
+    return payload
+
+
+def require_operator_or_service(
+    request: Request,
+    creds: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
+) -> security.TokenPayload:
+    """Accept an operator session token OR any service-audience token.
+
+    For read-only topology endpoints reachable from both the UI (operator
+    session) and peer components (service token). The signature + expiry
+    are verified the same way for both; only the `aud` claim differs.
+    Decoding with `expected_audience=None` skips PyJWT's audience check,
+    so we enforce the allowed audiences ourselves: `operator`, or any
+    `service:<kind>`. A revoked operator session is still rejected.
+    """
+    if creds is None or not creds.credentials:
+        raise _problem(
+            status.HTTP_401_UNAUTHORIZED,
+            "Missing token",
+            "Provide a bearer token via the Authorization: Bearer header.",
+        )
+    token = creds.credentials
+    auth: AuthState = request.app.state.auth_state
+    if auth.is_revoked(token):
+        raise _problem(
+            status.HTTP_401_UNAUTHORIZED,
+            "Token revoked",
+            "Session was explicitly logged out. Login again to obtain a new token.",
+        )
+    try:
+        payload = security.decode_token(
+            token=token,
+            signing_key=auth.signing_key,
+            expected_audience=None,  # we validate the audience ourselves below
+        )
+    except Exception as e:
+        raise _problem(
+            status.HTTP_401_UNAUTHORIZED,
+            "Invalid token",
+            f"Bearer token rejected: {e}",
+        ) from e
+    is_operator = payload.aud == security.AUDIENCE_OPERATOR
+    is_service = payload.aud.startswith(security.SERVICE_AUDIENCE_PREFIX)
+    if not (is_operator or is_service):
+        raise _problem(
+            status.HTTP_401_UNAUTHORIZED,
+            "Wrong audience",
+            f"Token audience {payload.aud!r} is neither operator nor a service token.",
+        )
     return payload
 
 
