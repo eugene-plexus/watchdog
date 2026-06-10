@@ -108,6 +108,12 @@ _KIND_TO_MODULE: dict[ComponentKind, str] = {
     ComponentKind.memory: "eugene_plexus_memory",
     ComponentKind.identity: "eugene_plexus_identity",
     ComponentKind.connector: "eugene_plexus_connector",
+    ComponentKind.coordinator: "eugene_plexus_coordinator",
+    ComponentKind.trainer: "eugene_plexus_trainer",
+    ComponentKind.data: "eugene_plexus_data",
+    ComponentKind.eval: "eugene_plexus_eval",
+    ComponentKind.inference: "eugene_plexus_inference",
+    ComponentKind.cluster: "eugene_plexus_cluster",
 }
 
 # Env-var prefix per component kind, matching what each component's
@@ -118,6 +124,12 @@ _KIND_TO_ENV_PREFIX: dict[ComponentKind, str] = {
     ComponentKind.memory: "EUGENE_PLEXUS_MEM",
     ComponentKind.identity: "EUGENE_PLEXUS_IDENTITY",
     ComponentKind.connector: "EUGENE_PLEXUS_CONNECTOR",
+    ComponentKind.coordinator: "EUGENE_PLEXUS_CRD",
+    ComponentKind.trainer: "EUGENE_PLEXUS_TRN",
+    ComponentKind.data: "EUGENE_PLEXUS_DAT",
+    ComponentKind.eval: "EUGENE_PLEXUS_EVAL",
+    ComponentKind.inference: "EUGENE_PLEXUS_INF",
+    ComponentKind.cluster: "EUGENE_PLEXUS_CLU",
 }
 
 # Short, log-friendly label per component kind. Used by the output reader
@@ -134,6 +146,12 @@ _KIND_SHORT_LABEL: dict[ComponentKind, str] = {
     ComponentKind.memory: "memory",
     ComponentKind.identity: "identity",
     ComponentKind.connector: "connector",
+    ComponentKind.coordinator: "coordinator",
+    ComponentKind.trainer: "trainer",
+    ComponentKind.data: "data",
+    ComponentKind.eval: "eval",
+    ComponentKind.inference: "inference",
+    ComponentKind.cluster: "cluster",
 }
 
 
