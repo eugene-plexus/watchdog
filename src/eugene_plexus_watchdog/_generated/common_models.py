@@ -12,52 +12,153 @@ from pydantic import AnyUrl, AwareDatetime, BaseModel, ConfigDict, Field
 
 class Role(StrEnum):
     """
-    The speaker of a single message in a conversation.
+    The speaker of a single message in a conversation. `tool` carries
+    the result(s) of a tool / region call fed back into deliberation
+    (see ToolResult) — its own kind of utterance, distinct from the
+    `user` who originally spoke.
+
     """
 
     system = 'system'
     user = 'user'
     assistant = 'assistant'
     hemisphere = 'hemisphere'
+    tool = 'tool'
 
 
-class Message(BaseModel):
+class ToolChannel(StrEnum):
     """
-    A single message in an Eugene Plexus conversation. The shape is
-    deliberately close to the OpenAI / Anthropic chat message format so
-    that adapters don't have to re-shape on every hop, but `role` includes
-    `hemisphere` for messages emitted by one of the parallel drivers
-    during a bicameral pass (visible to corpus callosum and UI debug
-    views, not normally to the end user).
+    Direction a tool moves information relative to Eugene — the spine
+    of the perception/action model.
+
+    * `afferent` — brings world-state IN. Senses and reads: web
+      fetch, a connector delivering an inbound message, memory
+      recall, reading a file. Changes nothing in the world.
+    * `efferent` — acts ON the world. Send, write, delete, pay — and
+      notably *speaking to the user* (the Broca / voice-pass
+      effector; the user-facing reply is an efferent tool, not a
+      privileged final output). `effect` is consulted only for this
+      channel.
+    * `internal` — a regimented call to another region rather than
+      the outside world: emotion-read of an inbound message (feeds
+      NT), agreement scoring, summarization, topic-shift detection.
+      No external contact; the result typically updates internal
+      state. Reuses the same envelope so region-to-region cognition
+      threads through the identical `role: tool` machinery.
 
     """
 
-    role: Role
-    content: str = Field(
+    afferent = 'afferent'
+    efferent = 'efferent'
+    internal = 'internal'
+
+
+class ToolEffect(StrEnum):
+    """
+    Reversibility class of an `efferent` tool — drives the
+    System-1/System-2 escalation gate. Ignored for `afferent` /
+    `internal` tools, which commit nothing to the world (treat as
+    `read_only`).
+
+    * `read_only` — no world-effect (a pure read). Reflexive-eligible:
+      a single pre-deliberation stream may fire it without bicameral
+      agreement.
+    * `reversible` — an undoable side effect (compose a draft, write a
+      scratch file). The action taken *pre*-deliberation that produces
+      the artifact deliberation then edits — e.g. banging out an email
+      draft before studying it.
+    * `irreversible` — cannot be undone (send, delete, pay, post
+      publicly). Always *post*-deliberation: requires deliberation
+      plus bicameral agreement before the singular effector executes.
+
+    Reversibility is the static property; whether an action fires pre-
+    or post-deliberation is the runtime routing the gate derives from
+    it plus live NT state (anxiety can escalate even a read into
+    deliberation). Conservative default: anything not provably
+    reversible registers `irreversible`. Promotion is explicit, never
+    inferred.
+
+    """
+
+    read_only = 'read_only'
+    reversible = 'reversible'
+    irreversible = 'irreversible'
+
+
+class ToolDefinition(BaseModel):
+    """
+    A capability Eugene can invoke, normalized across backends. The
+    orchestrator owns the catalog; each hemisphere-driver adapter
+    translates this into its backend's native mechanism (Anthropic
+    tool-use blocks, OpenAI function-calling, or Hermes-style
+    `<tool_call>` text for `openai_compat_http` models without native
+    support).
+
+    """
+
+    name: str = Field(
         ...,
-        description='Message text. v0.1 is text-only; multimodal extensions deferred.',
+        description='Stable tool identifier. Echoed in `ToolCall.name`.',
+        pattern='^[a-zA-Z0-9_-]{1,64}$',
     )
-    driverName: str | None = Field(
+    description: str | None = Field(
         None,
-        description='When `role == "hemisphere"`, the operator-supplied name of\nthe driver that produced this message (e.g. `"left"`,\n`"right"`, or any free-form label set by the orchestrator\'s\n`drivers` config). Omitted otherwise. Identity is owned by\nthe orchestrator\'s topology config — drivers themselves do\nnot know their position in the pair.\n',
+        description='What the tool does, in model-facing language. This is prompt\nmaterial — the model reads it to decide when to call.\n',
     )
-    timestamp: AwareDatetime | None = Field(
-        None, description='When the message was produced. Server-assigned if omitted.'
+    inputSchema: dict[str, Any] = Field(
+        ...,
+        description='JSON Schema (draft 2020-12) for the arguments. Passed to the\nbackend verbatim; adapters needing another dialect translate\nit.\n',
     )
-    passIndex: int | None = Field(
+    channel: ToolChannel
+    effect: ToolEffect | None = 'read_only'
+
+
+class ToolCall(BaseModel):
+    """
+    A model's request to invoke a tool, surfaced in
+    `GenerateResponse.toolCalls` and carried back in `Message` for the
+    next pass. The driver only surfaces the request; the
+    orchestrator — never the driver — decides whether to execute it,
+    after the reflexive/deliberative gate and (for `irreversible`
+    efferent effects) bicameral agreement.
+
+    """
+
+    id: str = Field(
+        ...,
+        description="Call id, unique within a turn; correlates a `ToolResult` back\nto this call. Adapters map their backend's native id\n(Anthropic `tool_use.id`, OpenAI `tool_call.id`) to/from this.\n",
+    )
+    name: str = Field(
+        ..., description='Tool name, matching a registered `ToolDefinition.name`.'
+    )
+    arguments: dict[str, Any] = Field(
+        ...,
+        description="Arguments object conforming to the tool's `inputSchema`.\nAdapters parse the backend's argument representation (often a\nJSON string) into this object before returning.\n",
+    )
+
+
+class ToolResult(BaseModel):
+    """
+    The outcome of executing a `ToolCall`, produced by the singular
+    tool-runner (one effector for the whole organism — two
+    hemispheres, one set of hands) and fed back into BOTH hemispheres
+    on the next pass as a `role: tool` message.
+
+    """
+
+    callId: str = Field(..., description='The `ToolCall.id` this result answers.')
+    content: str | None = Field(
         None,
-        description='Zero-based index of the bicameral pass that produced this message.\nPass 0 is the initial hemisphere response; subsequent passes are\nre-prompts after corpus-callosum disagreement.\n',
-        ge=0,
+        description='Result as text — human-readable, or JSON rendered as a string\nfor models that only consume text. Large results may be\ntruncated by the runner before feeding back.\n',
     )
-
-
-class Conversation(BaseModel):
-    """
-    An ordered list of messages constituting a conversation history.
-    """
-
-    id: UUID | None = Field(None, description='Server-assigned conversation id.')
-    messages: list[Message]
+    structuredContent: dict[str, Any] | None = Field(
+        None,
+        description="Typed result payload, for `internal` regimented calls and\nstructured tool outputs — e.g. an emotion-read returning\n`{joy: 0.1, anger: 0.7, ...}` that the orchestrator routes\ninto the NT system. Mirrors MCP's `structuredContent`. When\nboth are present, `content` is the text rendering of this.\n",
+    )
+    isError: bool | None = Field(
+        False,
+        description="True if the tool failed; the error text goes in `content`. The\nmodel sees the failure and can react (retry, pick another\ntool, give up) — like a person whose action didn't work.\n",
+    )
 
 
 class NTLevel(BaseModel):
@@ -807,6 +908,99 @@ class RestartResult(BaseModel):
     )
 
 
+class Kind(StrEnum):
+    """
+    Discriminates the payload. Extensible — future afferent
+    modalities (timer, sensor, …) add an enum value + a payload
+    field without changing the envelope.
+
+    """
+
+    message = 'message'
+    presence = 'presence'
+
+
+class Change(StrEnum):
+    """
+    The occupancy transition observed.
+    """
+
+    entered = 'entered'
+    left = 'left'
+
+
+class PresenceEvent(BaseModel):
+    """
+    Afferent perception of the social environment's *occupancy* —
+    who entered or left an environment — distinct from message
+    content. This is the external trigger that lets Eugene
+    *initiate* (not just respond): the continuous loop + speak-as-a-
+    decision give the ability to start talking; presence gives the
+    social cue to.
+
+    Presence is a LOSSY, NT-modulated salience signal, NOT a queue:
+    most occupancy churn is low-salience and never attended (the
+    loop drops it), the same way a person doesn't consciously track
+    everyone's comings and goings. Salience is gated by NT state —
+    wary attends to strangers, relaxed attends to known persons.
+    Restraint about acting on presence is *learned*, not a policy
+    knob.
+
+    Actor resolution ties into identity: an enter/leave resolves to
+    a `personId` when known, otherwise to a `PlatformAlias` / the
+    pending-link flow. "X entered" only means something once X is a
+    known person.
+
+    """
+
+    change: Change = Field(..., description='The occupancy transition observed.')
+    environment: MessageSource = Field(
+        ...,
+        description='The environment (platform / channel) whose occupancy\nchanged. Reuses `MessageSource` addressing.\n',
+    )
+    personId: UUID | None = Field(
+        None,
+        description='The actor, resolved to a known person. Omitted when the\nactor is unknown — see `alias`.\n',
+    )
+    alias: PlatformAlias | None = Field(
+        None,
+        description='Set instead of `personId` when the actor is an unrecognized\nplatform user (routes to the pending-link flow rather than\nto relationship-aware behavior).\n',
+    )
+
+
+class EfferentSpeechAct(BaseModel):
+    """
+    An efferent (act-out) utterance Eugene has *decided* to emit.
+    Speech is not a privileged terminal step — it is an efferent
+    action the gate elects when speaking has higher anticipated
+    reward than continuing to think or staying silent. Silence is a
+    valid outcome and simply produces no `EfferentSpeechAct`.
+
+    Routed to a destination by the speak effector: a reply in a
+    Discord channel goes to the connector's outbound API for that
+    channel; a reply in the UI goes to the UI's speech stream;
+    *initiated* speech (no triggering event) picks its destination
+    from social context. `destination` reuses `MessageSource`
+    addressing — the mirror of an `AfferentEvent.source`.
+
+    """
+
+    destination: MessageSource = Field(
+        ...,
+        description='Where the utterance is delivered (mirror of afferent `source`).',
+    )
+    content: str
+    inResponseTo: UUID | None = Field(
+        None,
+        description='The `AfferentEvent.eventId` this utterance reacts to, when\nreactive. Omitted for self-initiated speech (mind-wandering,\npresence-triggered) — Eugene speaking on its own initiative,\nnot in reply to a specific event.\n',
+    )
+    conversationId: UUID | None = Field(
+        None,
+        description='Conversation thread the utterance belongs to, when applicable.',
+    )
+    timestamp: AwareDatetime
+
+
 class TrainingGoal(StrEnum):
     """
     Mirrors the wizard's "what do you want to do" screen. Drives which
@@ -902,7 +1096,7 @@ class ArchitectureConfig(BaseModel):
     weightTying: bool | None = True
 
 
-class Kind(StrEnum):
+class Kind1(StrEnum):
     pretraining = 'pretraining'
     continued_pretraining = 'continued_pretraining'
     sft = 'sft'
@@ -941,7 +1135,7 @@ class Quantization(BaseModel):
     computeDtype: ComputeDtype | None = None
 
 
-class Kind1(StrEnum):
+class Kind2(StrEnum):
     adamw = 'adamw'
     sgd = 'sgd'
     adadelta = 'adadelta'
@@ -950,7 +1144,7 @@ class Kind1(StrEnum):
 
 
 class Optimizer(BaseModel):
-    kind: Kind1
+    kind: Kind2
     learningRate: float
     weightDecay: float | None = None
     betas: list[float] | None = Field(None, max_length=2, min_length=2)
@@ -958,7 +1152,7 @@ class Optimizer(BaseModel):
     fused: bool | None = True
 
 
-class Kind2(StrEnum):
+class Kind3(StrEnum):
     wsd = 'wsd'
     epoch = 'epoch'
     plateau = 'plateau'
@@ -971,7 +1165,7 @@ class DecayType(StrEnum):
 
 
 class Scheduler(BaseModel):
-    kind: Kind2 | None = 'wsd'
+    kind: Kind3 | None = 'wsd'
     warmupSteps: int | None = None
     maxLr: float | None = None
     minLr: float | None = None
@@ -1217,7 +1411,7 @@ class ExportSettings(BaseModel):
     format: Format | None = 'native'
 
 
-class Kind3(StrEnum):
+class Kind4(StrEnum):
     data_prep = 'data_prep'
     tokenizer = 'tokenizer'
     training = 'training'
@@ -1237,6 +1431,53 @@ class PipelineStatus(StrEnum):
     failed = 'failed'
     cancelled = 'cancelled'
     skipped = 'skipped'
+
+
+class Message(BaseModel):
+    """
+    A single message in an Eugene Plexus conversation. The shape is
+    deliberately close to the OpenAI / Anthropic chat message format so
+    that adapters don't have to re-shape on every hop, but `role` includes
+    `hemisphere` for messages emitted by one of the parallel drivers
+    during a bicameral pass (visible to corpus callosum and UI debug
+    views, not normally to the end user).
+
+    """
+
+    role: Role
+    content: str = Field(
+        ...,
+        description='Message text. v0.1 is text-only; multimodal extensions deferred.',
+    )
+    driverName: str | None = Field(
+        None,
+        description='When `role == "hemisphere"`, the operator-supplied name of\nthe driver that produced this message (e.g. `"left"`,\n`"right"`, or any free-form label set by the orchestrator\'s\n`drivers` config). Omitted otherwise. Identity is owned by\nthe orchestrator\'s topology config — drivers themselves do\nnot know their position in the pair.\n',
+    )
+    timestamp: AwareDatetime | None = Field(
+        None, description='When the message was produced. Server-assigned if omitted.'
+    )
+    passIndex: int | None = Field(
+        None,
+        description='Zero-based index of the bicameral pass that produced this message.\nPass 0 is the initial hemisphere response; subsequent passes are\nre-prompts after corpus-callosum disagreement.\n',
+        ge=0,
+    )
+    toolCalls: list[ToolCall] | None = Field(
+        None,
+        description='Tool-invocation requests emitted by this message. Present on\n`assistant` / `hemisphere` messages that asked for tools;\ncarried in history so the next pass sees what was requested.\n',
+    )
+    toolResults: list[ToolResult] | None = Field(
+        None,
+        description='Tool / region-call outcomes carried by a `role: tool` message\nand fed back into the next pass. A single `tool` message\nbundles the results of the calls from the preceding turn.\n',
+    )
+
+
+class Conversation(BaseModel):
+    """
+    An ordered list of messages constituting a conversation history.
+    """
+
+    id: UUID | None = Field(None, description='Server-assigned conversation id.')
+    messages: list[Message]
 
 
 class NTState(BaseModel):
@@ -1446,15 +1687,16 @@ class RelationshipSummary(BaseModel):
 class IncomingMessage(BaseModel):
     """
     Normalized message shape an adapter posts to the
-    orchestrator's `POST /v1/chat`. Adapter-specific platform
-    details collapse to this universal shape; the orchestrator
-    never sees Discord-specific or Slack-specific fields.
+    orchestrator, wrapped in an `AfferentEvent` (`kind: message`)
+    to `POST /v1/events`. Adapter-specific platform details
+    collapse to this universal shape; the orchestrator never sees
+    Discord-specific or Slack-specific fields.
 
     """
 
     personId: UUID = Field(
         ...,
-        description="Sender's `personId` in the identity component. If the\nadapter received a message from an unrecognized\nplatform user, it MUST file a `PendingIdentityLink`\nand not call `/v1/chat` — Eugene only responds to\nknown people.\n",
+        description="Sender's `personId` in the identity component. If the\nadapter received a message from an unrecognized\nplatform user, it MUST file a `PendingIdentityLink`\nand not post the event — Eugene only responds to\nknown people.\n",
     )
     conversationId: UUID | None = Field(
         None,
@@ -1465,6 +1707,47 @@ class IncomingMessage(BaseModel):
     channelContext: list[ChannelContextEntry] | None = Field(
         None,
         description="For channel-mention adapters (Discord channel\nmentions, Slack channels): recent platform messages\npreceding the mention, included for conversational\ngrounding. The orchestrator may surface these to\nhemispheres as ambient context, but only the actual\nmention/reply gets persisted to memory (privacy\ndefault: don't store messages from people who didn't\ninvoke Eugene).\n",
+    )
+
+
+class AfferentEvent(BaseModel):
+    """
+    A single afferent (perception-in) event injected into the
+    orchestrator's continuous loop via `POST /v1/events`. The
+    unified envelope for everything Eugene perceives — a person's
+    message, a presence change, and future sensory inputs all arrive
+    as one shape, differing only by `kind` and the typed payload.
+
+    Injection is fire-and-forget: the endpoint enqueues the event
+    and returns `202` immediately. Whether, when, and how Eugene
+    responds is the loop's decision, not this call's — there is no
+    synchronous reply (the request-response `/v1/chat` surface was
+    removed). Speech leaves asynchronously; see `EfferentSpeechAct`
+    and `GET /v1/stream/consciousness`.
+
+    An unsolicited event arriving keeps `role: user` semantics —
+    Eugene did not "call hear." Only Eugene's *interpretation* of it
+    (and any solicited perception) is an afferent tool cycle.
+
+    """
+
+    eventId: UUID = Field(
+        ...,
+        description="Caller-minted id. Echoed by any resulting `EfferentSpeechAct`\nin `inResponseTo` when Eugene's reply is reactive to this\nevent, for correlation.\n",
+    )
+    kind: Kind = Field(
+        ...,
+        description='Discriminates the payload. Extensible — future afferent\nmodalities (timer, sensor, …) add an enum value + a payload\nfield without changing the envelope.\n',
+    )
+    source: MessageSource = Field(
+        ..., description='Where the event came from (platform / channel).'
+    )
+    timestamp: AwareDatetime
+    message: IncomingMessage | None = Field(
+        None, description='Present when `kind` is `message`.'
+    )
+    presence: PresenceEvent | None = Field(
+        None, description='Present when `kind` is `presence`.'
     )
 
 
@@ -1494,7 +1777,7 @@ class TrainingRecipe(BaseModel):
 
     """
 
-    kind: Kind
+    kind: Kind1
     baseCheckpoint: CheckpointRef | None = Field(
         None,
         description='Required for continued_pretraining / sft / lora / qlora / dpo.',
@@ -1535,7 +1818,7 @@ class PipelineStage(BaseModel):
     One stage of a PipelineRun, delegated to a peer component.
     """
 
-    kind: Kind3
+    kind: Kind4
     status: PipelineStatus
     component: ComponentKind | None = None
     resourceId: str | None = Field(
