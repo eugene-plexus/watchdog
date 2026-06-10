@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from enum import StrEnum
+from enum import IntEnum, StrEnum
 from typing import Any
 from uuid import UUID
 
@@ -85,22 +85,39 @@ class NTLevel(BaseModel):
 
 class DriverEntry(BaseModel):
     """
-    One operator-configured hemisphere-driver in the orchestrator's
-    topology. The orchestrator owns the `name` (free-form, used for
-    labelling messages and UI tabs); drivers themselves are anonymous
-    and report only their backend / model identity. v0.1 expects two
-    entries; v0.2+ generalizes to N (with backup/failover semantics
-    layered on top).
+    One operator-configured hemisphere-driver *slot* in the
+    orchestrator's topology. The orchestrator owns the `name`
+    (free-form, used for labelling messages and UI tabs); drivers
+    themselves are anonymous and report only their backend / model
+    identity. The bicameral loop requires exactly two slots.
+
+    A slot is a **priority list** of backends (`backends`), not a
+    single backend. Each entry is the NAME of a hemisphere-driver
+    entry in the watchdog topology (`GET /v1/components`,
+    `kind: hemisphere-driver`); the orchestrator resolves names to
+    URLs at startup. This keeps backend URLs in exactly one place
+    (the watchdog topology) instead of duplicating them into the
+    orchestrator's config (v0.2.1).
+
+    On each chat turn the orchestrator tries `backends[0]`; if it
+    fails in a cascade-eligible way (transport error / 5xx /
+    timeout) it falls through to `backends[1]`, and so on. A 4xx
+    fails the slot HARD without cascading — a 4xx is a
+    request/auth/config bug that the next backend would hit
+    identically, and cascading past it would mask the real problem.
+    Stock installs run one backend per slot.
 
     """
 
     name: str = Field(
         ...,
-        description='Operator-supplied label (e.g. `"left"`, `"right"`, or any\nfree-form string). Stamped onto every message this driver\nproduces and surfaced in the UI as the tab/column label.\n',
+        description='Operator-supplied label (e.g. `"left"`, `"right"`, or any\nfree-form string). Stamped onto every message this slot\nproduces and surfaced in the UI as the tab/column label.\n',
         min_length=1,
     )
-    url: AnyUrl = Field(
-        ..., description="Base URL where the driver's HTTP API is reachable."
+    backends: list[str] = Field(
+        ...,
+        description='Ordered priority list of watchdog-topology hemisphere-driver\nentry NAMES that back this slot. The orchestrator resolves\neach name to a URL via `GET /v1/components` at startup and\ntries them in order on each turn, cascading to the next on\ntransport error / 5xx / timeout (but not on 4xx). At least\none entry is required. (Not a URL — a topology entry name.)\n',
+        min_length=1,
     )
 
 
@@ -131,6 +148,13 @@ class ComponentKind(StrEnum):
     `identity` (Default Mode Network analogue) and `connector`
     (external sense organs).
 
+    v0.3 adds the local-LLM-platform components: `coordinator`
+    (owns the `TrainingProject` aggregate and sequences pipeline
+    runs across the others), `trainer` (executes training runs +
+    owns checkpoints), `data` (datasets + tokenizers),
+    `eval` (eval suites + results), `inference` (OpenAI-compatible
+    local serving), and `cluster` (deferred; multi-host workers).
+
     """
 
     orchestrator = 'orchestrator'
@@ -138,6 +162,12 @@ class ComponentKind(StrEnum):
     memory = 'memory'
     identity = 'identity'
     connector = 'connector'
+    coordinator = 'coordinator'
+    trainer = 'trainer'
+    data = 'data'
+    eval = 'eval'
+    inference = 'inference'
+    cluster = 'cluster'
 
 
 class Problem(BaseModel):
@@ -777,6 +807,438 @@ class RestartResult(BaseModel):
     )
 
 
+class TrainingGoal(StrEnum):
+    """
+    Mirrors the wizard's "what do you want to do" screen. Drives which
+    recipe/fields the UI surfaces (via showWhen) and which defaults apply.
+
+    """
+
+    pretrain_from_scratch = 'pretrain_from_scratch'
+    continue_pretraining = 'continue_pretraining'
+    finetune = 'finetune'
+    train_adapter = 'train_adapter'
+    evaluate = 'evaluate'
+    serve = 'serve'
+
+
+class ModelType(StrEnum):
+    decoder_only = 'decoder_only'
+
+
+class Activation(StrEnum):
+    relu = 'relu'
+    leaky_relu = 'leaky_relu'
+    gelu = 'gelu'
+    elu = 'elu'
+    swiglu = 'swiglu'
+
+
+class AttentionVariant(StrEnum):
+    gqa = 'gqa'
+    differential = 'differential'
+
+
+class Type(StrEnum):
+    dense = 'dense'
+    moe = 'moe'
+
+
+class Ffn(BaseModel):
+    """
+    Replaces CLLM's cognitive/hemisphere FFN with a generic dense|moe choice.
+    """
+
+    type: Type | None = 'dense'
+    nExperts: int | None = Field(None, ge=1)
+    topK: int | None = Field(None, ge=1)
+    useSharedExpert: bool | None = False
+    auxLossWeight: float | None = None
+
+
+class MixtureOfDepths(BaseModel):
+    enabled: bool | None = False
+    capacityFactor: float | None = None
+    auxLossWeight: float | None = None
+
+
+class Mode(StrEnum):
+    none = 'none'
+    ntk = 'ntk'
+    yarn = 'yarn'
+
+
+class ContextExtension(BaseModel):
+    mode: Mode | None = 'none'
+    maxFactor: float | None = None
+
+
+class ArchitectureConfig(BaseModel):
+    """
+    Generic decoder-only transformer config. Lifted from CLLM's
+    architecture package with all NT/hemisphere/cognitive fields removed.
+    See §10: cognitive.use_moe -> generic ffn.type; mood_vector dropped.
+
+    """
+
+    modelType: ModelType
+    nLayer: int = Field(..., ge=1)
+    nHead: int = Field(..., ge=1)
+    nKvHead: int | None = Field(None, description='GQA KV heads; omit for full MHA.')
+    nEmbd: int = Field(..., description='Must be divisible by nHead.', ge=1)
+    blockSize: int = Field(..., description='Training context length.', ge=1)
+    vocabSize: int = Field(..., ge=1)
+    activation: Activation | None = 'swiglu'
+    ropeBase: float | None = 500000
+    useQkNorm: bool | None = False
+    attentionVariant: AttentionVariant | None = 'gqa'
+    ffn: Ffn | None = Field(
+        None,
+        description="Replaces CLLM's cognitive/hemisphere FFN with a generic dense|moe choice.",
+    )
+    mixtureOfDepths: MixtureOfDepths | None = None
+    blockAttnResGroupSize: int | None = Field(0, description='0 = disabled.')
+    contextExtension: ContextExtension | None = None
+    weightTying: bool | None = True
+
+
+class Kind(StrEnum):
+    pretraining = 'pretraining'
+    continued_pretraining = 'continued_pretraining'
+    sft = 'sft'
+    lora = 'lora'
+    qlora = 'qlora'
+    dpo = 'dpo'
+
+
+class Adapter(BaseModel):
+    """
+    LoRA/QLoRA adapter config (kind in [lora, qlora]).
+    """
+
+    rank: int | None = Field(None, ge=1)
+    alpha: float | None = None
+    dropout: float | None = None
+    targetModules: list[str] | None = None
+
+
+class Bits(IntEnum):
+    integer_4 = 4
+    integer_8 = 8
+
+
+class ComputeDtype(StrEnum):
+    bf16 = 'bf16'
+    fp16 = 'fp16'
+
+
+class Quantization(BaseModel):
+    """
+    QLoRA base-weight quantization (kind == qlora).
+    """
+
+    bits: Bits | None = None
+    computeDtype: ComputeDtype | None = None
+
+
+class Kind1(StrEnum):
+    adamw = 'adamw'
+    sgd = 'sgd'
+    adadelta = 'adadelta'
+    adabelief = 'adabelief'
+    muon = 'muon'
+
+
+class Optimizer(BaseModel):
+    kind: Kind1
+    learningRate: float
+    weightDecay: float | None = None
+    betas: list[float] | None = Field(None, max_length=2, min_length=2)
+    eps: float | None = None
+    fused: bool | None = True
+
+
+class Kind2(StrEnum):
+    wsd = 'wsd'
+    epoch = 'epoch'
+    plateau = 'plateau'
+    cosine = 'cosine'
+
+
+class DecayType(StrEnum):
+    cosine = 'cosine'
+    linear = 'linear'
+
+
+class Scheduler(BaseModel):
+    kind: Kind2 | None = 'wsd'
+    warmupSteps: int | None = None
+    maxLr: float | None = None
+    minLr: float | None = None
+    totalSteps: int | None = Field(None, description='Omit to derive via chinchilla.')
+    chinchillaTokensPerParam: float | None = Field(
+        None, description='Auto total_steps when totalSteps null.'
+    )
+    decayType: DecayType | None = None
+    decayFraction: float | None = None
+
+
+class Dtype(StrEnum):
+    auto = 'auto'
+    bf16 = 'bf16'
+    fp16 = 'fp16'
+    fp32 = 'fp32'
+
+
+class GradScaler(StrEnum):
+    auto = 'auto'
+    always = 'always'
+    never = 'never'
+
+
+class Precision(BaseModel):
+    dtype: Dtype | None = 'auto'
+    gradScaler: GradScaler | None = 'auto'
+
+
+class GradientClip(BaseModel):
+    percentile: float | None = 0.9
+    historySize: int | None = 100
+    maxClipValue: float | None = None
+    minClipValue: float | None = None
+
+
+class CollapseStop(BaseModel):
+    """
+    Mode-collapse early stop (CLLM SampledTokenTracker, de-consciousness'd).
+    """
+
+    minLogitEntropy: float | None = None
+    warmupGraceSteps: int | None = None
+
+
+class Hyperparameters(BaseModel):
+    """
+    Every output-affecting knob, grouped. Sourced from CLLM's training config.
+    """
+
+    batchSize: int | None = Field(None, ge=1)
+    gradAccumSteps: int | None = Field(1, ge=1)
+    maxSteps: int | None = Field(
+        None, description='Omit to derive from maxEpochs / dataset size.'
+    )
+    maxEpochs: int | None = None
+    seed: int | None = 1337
+    optimizer: Optimizer | None = None
+    scheduler: Scheduler | None = None
+    precision: Precision | None = None
+    gradientClip: GradientClip | None = None
+    collapseStop: CollapseStop | None = Field(
+        None,
+        description="Mode-collapse early stop (CLLM SampledTokenTracker, de-consciousness'd).",
+    )
+
+
+class Mode1(StrEnum):
+    cpu = 'cpu'
+    single_gpu = 'single_gpu'
+    multi_gpu = 'multi_gpu'
+    multi_node = 'multi_node'
+
+
+class Backend(StrEnum):
+    nccl = 'nccl'
+    gloo = 'gloo'
+
+
+class Node(BaseModel):
+    host: str | None = None
+    gpuCount: int | None = None
+    nodeRank: int | None = None
+
+
+class CheckpointStrategy(StrEnum):
+    master_only = 'master_only'
+    all_nodes = 'all_nodes'
+
+
+class Distributed(BaseModel):
+    """
+    Present for multi_gpu / multi_node.
+    """
+
+    backend: Backend | None = 'nccl'
+    masterAddr: str | None = None
+    masterPort: int | None = None
+    nodes: list[Node] | None = None
+    findUnusedParameters: bool | None = False
+    bucketCapMb: int | None = None
+    gradientAsBucketView: bool | None = None
+    staticGraph: bool | None = None
+    checkpointStrategy: CheckpointStrategy | None = 'master_only'
+
+
+class HardwareTopology(BaseModel):
+    """
+    How a run is placed on hardware. Sourced from CLLM gpu_manager +
+    distributed_config (torchrun/DDP env generation).
+
+    """
+
+    mode: Mode1
+    gpuIndices: list[int] | None = None
+    excludeGpus: list[int] | None = None
+    minMemoryGb: float | None = None
+    distributed: Distributed | None = Field(
+        None, description='Present for multi_gpu / multi_node.'
+    )
+
+
+class RunStatus(StrEnum):
+    """
+    queued -> preparing (build model/data/optimizer) -> running -> completed.
+    paused/resumed are operator actions; failed carries lastError; cancelled
+    is operator-initiated stop. Note: these are RUN states owned by the
+    trainer service, distinct from the watchdog's ComponentStatus for the
+    trainer PROCESS.
+
+    """
+
+    queued = 'queued'
+    preparing = 'preparing'
+    running = 'running'
+    paused = 'paused'
+    completed = 'completed'
+    failed = 'failed'
+    cancelled = 'cancelled'
+
+
+class TrainingMetricPoint(BaseModel):
+    """
+    One sampled point of training health. Streamed over SSE + persisted for curves.
+    """
+
+    step: int = Field(..., ge=0)
+    timestamp: AwareDatetime | None = None
+    loss: float | None = None
+    valLoss: float | None = None
+    learningRate: float | None = None
+    gradNorm: float | None = None
+    gradClipValue: float | None = None
+    tokensPerSec: float | None = None
+    vramGb: float | None = None
+    tokenEntropy: float | None = Field(
+        None, description='Sampled-token Shannon entropy (collapse monitor).'
+    )
+
+
+class Checkpoint(BaseModel):
+    """
+    A saved model state produced by a run. Consumed by eval + inference.
+    """
+
+    checkpointId: UUID
+    runId: UUID
+    projectId: UUID | None = None
+    step: int = Field(..., ge=0)
+    epoch: int | None = Field(None, ge=0)
+    createdAt: AwareDatetime
+    path: str | None = Field(None, description='Filesystem path on the trainer host.')
+    sizeBytes: int | None = None
+    valLoss: float | None = None
+    isLatest: bool | None = False
+    isBest: bool | None = False
+    tags: list[str] | None = None
+
+
+class CheckpointRef(BaseModel):
+    """
+    Lightweight reference to a checkpoint (id + enough to display).
+    """
+
+    checkpointId: UUID
+    runId: UUID | None = None
+    step: int | None = None
+    label: str | None = None
+
+
+class DatasetRef(BaseModel):
+    """
+    Reference to a dataset MANIFEST owned by the data component, plus the
+    per-project curriculum settings (weight + min-iteration gate) sourced
+    from CLLM's datasets.json schema.
+
+    """
+
+    datasetId: UUID
+    name: str | None = None
+    samplingWeight: float | None = Field(
+        1, description='Oversample(>1)/subsample(<1) factor.'
+    )
+    minIteration: int | None = Field(
+        0, description='Curriculum gate; introduce at this step.'
+    )
+
+
+class TokenizerRef(BaseModel):
+    """
+    Reference to a tokenizer owned by the data component (+ its vocab fingerprint).
+    """
+
+    tokenizerId: UUID
+    name: str | None = None
+    vocabSize: int | None = None
+    vocabFingerprint: str | None = Field(
+        None, description='SHA256; must match dataset pretokenization.'
+    )
+
+
+class EvalSuiteRef(BaseModel):
+    evalSuiteId: UUID
+    name: str | None = None
+
+
+class Format(StrEnum):
+    native = 'native'
+    safetensors = 'safetensors'
+    gguf = 'gguf'
+
+
+class ExportSettings(BaseModel):
+    """
+    How/where a finished model is served. Points at the inference component.
+    """
+
+    autoServeOnComplete: bool | None = False
+    target: str | None = Field(
+        None,
+        description='Inference endpoint name. Rendered as a componentKindHint dropdown\n(kind: inference) in the UI; saved value is the peer URL.\n',
+    )
+    format: Format | None = 'native'
+
+
+class Kind3(StrEnum):
+    data_prep = 'data_prep'
+    tokenizer = 'tokenizer'
+    training = 'training'
+    eval = 'eval'
+    serve = 'serve'
+
+
+class PipelineStatus(StrEnum):
+    """
+    Per-stage and overall status. skipped = stage not requested for this project.
+    """
+
+    pending = 'pending'
+    running = 'running'
+    paused = 'paused'
+    completed = 'completed'
+    failed = 'failed'
+    cancelled = 'cancelled'
+    skipped = 'skipped'
+
+
 class NTState(BaseModel):
     """
     A snapshot of Eugene's neurotransmitter state. v0.2 introduces real
@@ -1006,9 +1468,157 @@ class IncomingMessage(BaseModel):
     )
 
 
+class ModelTemplate(BaseModel):
+    """
+    A named preset of an ArchitectureConfig (e.g. "small-test-20L",
+    "deep-medium-40L" — the migrated CLLM config presets become built-ins).
+    Custom templates are clones with overrides.
+
+    """
+
+    name: str
+    displayName: str | None = None
+    description: str | None = None
+    builtin: bool | None = False
+    architecture: ArchitectureConfig
+    estimatedParamCount: int | None = Field(
+        None, description='Read-only; computed from architecture.'
+    )
+
+
+class TrainingRecipe(BaseModel):
+    """
+    What KIND of training and its method-specific params. UI uses
+    ConfigField.showWhen to reveal adapter/quantization blocks only for
+    the relevant kind.
+
+    """
+
+    kind: Kind
+    baseCheckpoint: CheckpointRef | None = Field(
+        None,
+        description='Required for continued_pretraining / sft / lora / qlora / dpo.',
+    )
+    adapter: Adapter | None = Field(
+        None, description='LoRA/QLoRA adapter config (kind in [lora, qlora]).'
+    )
+    quantization: Quantization | None = Field(
+        None, description='QLoRA base-weight quantization (kind == qlora).'
+    )
+    dpoBeta: float | None = Field(None, description='DPO temperature (kind == dpo).')
+
+
+class TrainingRun(BaseModel):
+    """
+    One execution of a TrainingProject. Lives inside the trainer service (§2).
+    """
+
+    runId: UUID
+    projectId: UUID
+    status: RunStatus
+    createdAt: AwareDatetime
+    startedAt: AwareDatetime | None = None
+    finishedAt: AwareDatetime | None = None
+    currentStep: int | None = Field(None, ge=0)
+    totalSteps: int | None = None
+    currentEpoch: int | None = Field(None, ge=0)
+    tokensSeen: int | None = Field(None, ge=0)
+    progressFraction: float | None = Field(None, ge=0.0, le=1.0)
+    latestMetrics: TrainingMetricPoint | None = None
+    bestValLoss: float | None = None
+    checkpointCount: int | None = Field(None, ge=0)
+    lastError: str | None = Field(None, description='Populated when status == failed.')
+
+
+class PipelineStage(BaseModel):
+    """
+    One stage of a PipelineRun, delegated to a peer component.
+    """
+
+    kind: Kind3
+    status: PipelineStatus
+    component: ComponentKind | None = None
+    resourceId: str | None = Field(
+        None, description='Id of the underlying resource (e.g. a trainer runId).'
+    )
+    startedAt: AwareDatetime | None = None
+    finishedAt: AwareDatetime | None = None
+    detail: str | None = None
+
+
+class TrainingRunRequest(BaseModel):
+    """
+    The resolved training spec the coordinator (or UI, for ad-hoc runs)
+    hands to the trainer's POST /v1/trainer/runs. Carries everything the
+    trainer needs to execute without owning project config; projectId is
+    for back-reference / single-active-run enforcement only.
+
+    """
+
+    projectId: UUID | None = None
+    architecture: ArchitectureConfig
+    recipe: TrainingRecipe
+    hyperparameters: Hyperparameters
+    hardware: HardwareTopology
+    tokenizer: TokenizerRef
+    datasets: list[DatasetRef]
+
+
 class MemorySearchResult(BaseModel):
     """
     Ranked list of matching memory entries.
     """
 
     entries: list[MemorySearchHit]
+
+
+class TrainingProject(BaseModel):
+    """
+    The key user-facing abstraction. A reusable, persisted description of
+    "a model you are building": what to train, from what data, with which
+    recipe and hyperparameters, on which hardware, evaluated how, exported
+    where. Runs are executions of a project (one project -> many runs).
+
+    """
+
+    projectId: UUID
+    name: str = Field(..., min_length=1)
+    description: str | None = None
+    goal: TrainingGoal
+    createdAt: AwareDatetime
+    updatedAt: AwareDatetime | None = None
+    modelTemplate: ModelTemplate | None = None
+    tokenizer: TokenizerRef | None = None
+    datasets: list[DatasetRef] | None = Field(
+        None,
+        description='Ordered dataset selection (with per-dataset weight + curriculum gate).',
+    )
+    recipe: TrainingRecipe | None = None
+    hyperparameters: Hyperparameters | None = None
+    hardware: HardwareTopology | None = None
+    evalSuites: list[EvalSuiteRef] | None = None
+    exportSettings: ExportSettings | None = None
+    latestRunId: UUID | None = None
+    latestRunStatus: RunStatus | None = None
+
+
+class PipelineRun(BaseModel):
+    """
+    One end-to-end execution of a TrainingProject's pipeline, owned by the
+    coordinator. Sequences stages across components (data prep -> tokenizer
+    -> training -> eval -> serve), each delegating to a peer component and
+    tracking the underlying resource id. One active pipeline per project.
+
+    """
+
+    pipelineRunId: UUID
+    projectId: UUID
+    status: PipelineStatus
+    createdAt: AwareDatetime
+    startedAt: AwareDatetime | None = None
+    finishedAt: AwareDatetime | None = None
+    currentStage: str | None = Field(
+        None, description='Kind of the stage currently executing.'
+    )
+    stages: list[PipelineStage]
+    lastError: str | None = None
