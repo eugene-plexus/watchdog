@@ -29,7 +29,7 @@ dependencies = [
     "pydantic-settings>=2.6,<3",
     "pyyaml>=6.0,<7",
     # v0.2 security stack — watchdog is the install's trust root.
-    "argon2-cffi>=23.1,<24",      # passphrase hash + master-key KDF
+    "argon2-cffi>=23.1,<26",      # passphrase hash + master-key KDF
     "pyjwt>=2.10,<3",             # session/service token sign + verify
     "pynacl>=1.5,<2",             # libsodium secretbox for at-rest envelopes
     "keyring>=25.5,<26",          # OS Credential Manager / Keychain / Secret Service
@@ -37,13 +37,13 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "pytest==8.4.2",
-    "pytest-asyncio==0.26.0",
+    "pytest==9.0.3",
+    "pytest-asyncio==1.4.0",
     "httpx>=0.27,<1",
-    "ruff==0.15.14",
-    "mypy==1.20.2",
+    "ruff==0.15.17",
+    "mypy==2.1.0",
     "types-pyyaml>=6,<7",
-    "datamodel-code-generator==0.57.0",
+    "datamodel-code-generator==0.63.0",
 ]
 
 [project.scripts]
